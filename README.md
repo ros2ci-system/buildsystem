@@ -9,8 +9,9 @@ is connected to the ROS build farm or to any official ROS infrastructure.**
 ## Rules for the code
 
 - Written in Rust.
-- No third-party crates, with one exception: `rustls` for TLS, and `ring`, the
-  cryptography provider it is built with, for hashing.
+- No third-party crates, with one exception: `rustls` for TLS, with `ring`, the
+  cryptography provider it is built with, also used for hashing, and
+  `webpki-roots`, the public certificate authorities as data.
 - No shelling out to other programs, and no FFI, where it can be avoided.
   Docker and Podman are reached through their HTTP API.
 
