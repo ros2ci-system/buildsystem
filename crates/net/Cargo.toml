@@ -1,0 +1,16 @@
+[package]
+name = "ci_net"
+description = "URLs, TCP connections and TLS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ci_http = { path = "../http" }
+# The one third-party dependency the project allows. It uses ring for its
+# cryptography, which builds with only a C compiler on Linux and Windows.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+
+[lints]
+workspace = true

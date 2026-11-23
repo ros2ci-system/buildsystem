@@ -5,6 +5,7 @@ members = [
     "crates/json",
     "crates/tar",
     "crates/http",
+    "crates/net",
     "crates/container",
     "crates/postgres",
     "crates/agent",
