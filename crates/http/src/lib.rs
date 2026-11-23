@@ -12,6 +12,8 @@
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
 
+pub mod server;
+
 /// Longest status or header line accepted.
 const MAX_LINE: usize = 16 * 1024;
 /// Most header lines accepted in one response.
@@ -185,7 +187,7 @@ impl<'a> Request<'a> {
     }
 }
 
-fn is_token_byte(b: u8) -> bool {
+pub(crate) fn is_token_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
 }
 
@@ -198,7 +200,7 @@ fn check_header_value(value: &str) -> Result<(), Error> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Framing {
+pub(crate) enum Framing {
     /// No body.
     None,
     /// This many bytes remain.
@@ -217,8 +219,7 @@ pub struct Response<S: Read> {
     pub status: u16,
     pub reason: String,
     headers: Vec<(String, String)>,
-    stream: BufReader<S>,
-    framing: Framing,
+    body: BodyReader<BufReader<S>>,
 }
 
 impl<S: Read> fmt::Debug for Response<S> {
@@ -250,8 +251,7 @@ impl<S: Read> Response<S> {
                 status,
                 reason,
                 headers,
-                stream,
-                framing,
+                body: BodyReader { stream, framing },
             });
         }
     }
@@ -286,7 +286,24 @@ impl<S: Read> Response<S> {
     pub fn body_text(&mut self, limit: usize) -> Result<String, Error> {
         Ok(String::from_utf8_lossy(&self.body_bytes(limit)?).into_owned())
     }
+}
 
+/// Reads the response body.
+impl<S: Read> Read for Response<S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.body.read(buf)
+    }
+}
+
+/// Decodes a message body from the stream it arrives on, according to
+/// how the headers said it is framed. Shared by the client, for response
+/// bodies, and the server, for request bodies.
+pub(crate) struct BodyReader<R: BufRead> {
+    pub(crate) stream: R,
+    pub(crate) framing: Framing,
+}
+
+impl<R: BufRead> BodyReader<R> {
     fn next_chunk(&mut self) -> io::Result<()> {
         let line = read_line(&mut self.stream).map_err(to_io)?;
         // Anything after ';' is a chunk extension, which nothing uses.
@@ -316,8 +333,7 @@ impl<S: Read> Response<S> {
     }
 }
 
-/// Reads the response body.
-impl<S: Read> Read for Response<S> {
+impl<R: BufRead> Read for BodyReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -386,7 +402,7 @@ fn to_io(e: Error) -> io::Error {
 
 /// Reads one line, without its line break. Accepts a bare `\n` as well as
 /// `\r\n`.
-fn read_line(stream: &mut impl BufRead) -> Result<String, Error> {
+pub(crate) fn read_line(stream: &mut impl BufRead) -> Result<String, Error> {
     let mut line = Vec::new();
     let read = stream
         .by_ref()
@@ -432,7 +448,7 @@ fn read_status_line(stream: &mut impl BufRead) -> Result<(u16, String), Error> {
     Ok((status, parts.next().unwrap_or("").to_string()))
 }
 
-fn read_headers(stream: &mut impl BufRead) -> Result<Vec<(String, String)>, Error> {
+pub(crate) fn read_headers(stream: &mut impl BufRead) -> Result<Vec<(String, String)>, Error> {
     let mut headers = Vec::new();
     loop {
         let line = read_line(stream)?;
@@ -457,7 +473,7 @@ fn read_headers(stream: &mut impl BufRead) -> Result<Vec<(String, String)>, Erro
     }
 }
 
-fn body_framing(headers: &[(String, String)]) -> Result<Framing, Error> {
+pub(crate) fn body_framing(headers: &[(String, String)]) -> Result<Framing, Error> {
     fn values<'a>(headers: &'a [(String, String)], name: &'a str) -> impl Iterator<Item = &'a str> {
         headers
             .iter()
