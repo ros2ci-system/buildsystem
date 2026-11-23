@@ -11,6 +11,8 @@ members = [
     "crates/protocol",
     "crates/coordinator",
     "crates/agent",
+    "crates/admin",
+    "crates/e2e",
 ]
 
 [workspace.package]

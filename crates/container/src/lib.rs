@@ -194,6 +194,8 @@ pub struct ContainerSpec {
     pub working_dir: Option<String>,
     /// Windows only: `process` or `hyperv`.
     pub isolation: Option<String>,
+    /// Labels to attach, so the containers can be found again later.
+    pub labels: Vec<(String, String)>,
 }
 
 /// The state of a container, from an inspect call.
@@ -305,6 +307,20 @@ impl Client {
         if let Some(dir) = &spec.working_dir {
             members.push(("WorkingDir", Value::from(dir.as_str())));
         }
+        if !spec.labels.is_empty() {
+            for (name, value) in &spec.labels {
+                check_label(name)?;
+                check_label(value)?;
+            }
+            members.push((
+                "Labels",
+                Value::object(
+                    spec.labels
+                        .iter()
+                        .map(|(name, value)| (name.as_str(), Value::from(value.as_str()))),
+                ),
+            ));
+        }
         if let Some(isolation) = &spec.isolation {
             members.push((
                 "HostConfig",
@@ -319,6 +335,38 @@ impl Client {
                 "create returned no container id".to_string(),
             )),
         }
+    }
+
+    /// The ids of all containers, running or not, that carry a label
+    /// with this name and value.
+    pub fn containers_with_label(&self, name: &str, value: &str) -> Result<Vec<String>, Error> {
+        check_label(name)?;
+        check_label(value)?;
+        let filters =
+            Value::object([("label", Value::strings([format!("{name}={value}")]))]).to_json();
+        let reply = self.json(
+            "GET",
+            &format!(
+                "/containers/json?all=true&filters={}",
+                percent_encode(&filters)
+            ),
+            None,
+        )?;
+        let list = reply.as_array().ok_or_else(|| {
+            Error::UnexpectedReply("the container list is not an array".to_string())
+        })?;
+        let mut ids = Vec::new();
+        for item in list {
+            match item.get("Id").and_then(Value::as_str) {
+                Some(id) if is_container_id(id) => ids.push(id.to_string()),
+                _ => {
+                    return Err(Error::UnexpectedReply(
+                        "a listed container has no id".to_string(),
+                    ))
+                }
+            }
+        }
+        Ok(ids)
     }
 
     /// Unpacks a tar archive into a directory of the container. The
@@ -512,6 +560,21 @@ fn check_id(id: &str) -> Result<(), Error> {
     }
 }
 
+/// Label names and values go into a filter expression, where `=` and
+/// quotes would change its meaning.
+fn check_label(text: &str) -> Result<(), Error> {
+    let ok = !text.is_empty()
+        && text.len() <= 128
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::InvalidArgument(format!("bad label {text:?}")))
+    }
+}
+
 /// Image references go into request paths and query strings. This accepts
 /// the characters a reference can contain and nothing else.
 fn check_reference(image: &str) -> Result<(), Error> {
@@ -690,6 +753,16 @@ mod tests {
             "a\nb", "é",
         ] {
             assert!(check_reference(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn labels() {
+        for good in ["ros2ci.agent", "0123abcd", "a-b_c.d"] {
+            assert!(check_label(good).is_ok(), "{good}");
+        }
+        for bad in ["", "a=b", "a b", "a\"b", "a,b", "é"] {
+            assert!(check_label(bad).is_err(), "{bad:?}");
         }
     }
 
