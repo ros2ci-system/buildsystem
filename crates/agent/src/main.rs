@@ -7,7 +7,6 @@
 //! job description file. Talking to the coordinator comes later; it will
 //! hand the same job descriptions to the same code.
 
-mod job;
 mod run;
 
 use std::fs;
@@ -16,8 +15,7 @@ use std::process::ExitCode;
 
 use ci_container::{Client, Endpoint};
 
-use job::JobDescription;
-use run::Outcome;
+use ci_protocol::{JobDescription, Outcome};
 
 const USAGE: &str = "\
 Usage: ci-agent run-job --job <file> --work-dir <dir> [--runtime <endpoint>]
@@ -105,7 +103,7 @@ fn run_job_command(args: &[String]) -> Result<ExitCode, String> {
     );
     Ok(match result.outcome {
         Outcome::Success => ExitCode::SUCCESS,
-        Outcome::BuildFailure | Outcome::Timeout => ExitCode::from(1),
+        Outcome::BuildFailure | Outcome::Timeout | Outcome::Cancelled => ExitCode::from(1),
         Outcome::InfrastructureFailure => ExitCode::from(2),
     })
 }

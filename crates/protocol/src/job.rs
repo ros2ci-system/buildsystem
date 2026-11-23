@@ -34,11 +34,22 @@ pub struct Input {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputSource {
-    /// A file on the agent's own disk, from a `file://` URL.
+    /// A file on the agent's own disk, from a `file://` URL. Only for
+    /// jobs run by hand on the agent's machine: the coordinator refuses
+    /// job descriptions that use it.
     LocalFile(PathBuf),
+    /// An `http://` or `https://` URL the agent downloads.
+    Url(String),
 }
 
 impl JobDescription {
+    /// Whether any input is read from the agent's own disk.
+    pub fn has_local_inputs(&self) -> bool {
+        self.inputs
+            .iter()
+            .any(|input| matches!(input.source, InputSource::LocalFile(_)))
+    }
+
     pub fn parse(text: &str) -> Result<JobDescription, String> {
         let doc = ci_json::parse(text).map_err(|e| e.to_string())?;
         if doc.as_object().is_none() {
@@ -116,13 +127,17 @@ impl JobDescription {
                     .get("url")
                     .and_then(Value::as_str)
                     .ok_or("each input needs a \"url\"")?;
-                let source = match url.strip_prefix("file://") {
-                    Some(path) if !path.is_empty() => InputSource::LocalFile(PathBuf::from(path)),
-                    _ => {
-                        return Err(format!(
-                            "input URL {url:?} is not supported; only file:// is"
-                        ))
+                let source = if let Some(path) = url.strip_prefix("file://") {
+                    if path.is_empty() {
+                        return Err(format!("input URL {url:?} has no path"));
                     }
+                    InputSource::LocalFile(PathBuf::from(path))
+                } else if url.starts_with("http://") || url.starts_with("https://") {
+                    InputSource::Url(url.to_string())
+                } else {
+                    return Err(format!(
+                        "input URL {url:?} must start with http://, https:// or file://"
+                    ));
                 };
                 inputs.push(Input {
                     name: name.to_string(),
@@ -149,7 +164,7 @@ impl JobDescription {
 
 /// A name that is safe to use as one file in a directory, on Linux and on
 /// Windows.
-fn is_plain_file_name(name: &str) -> bool {
+pub fn is_plain_file_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 200
         && name != "."
@@ -231,7 +246,7 @@ mod tests {
             &with(r#""environment": []"#),
             &with(r#""inputs": [{"name": "a"}]"#),
             &with(r#""inputs": [{"url": "file:///a"}]"#),
-            &with(r#""inputs": [{"name": "a", "url": "https://example.com/a"}]"#),
+            &with(r#""inputs": [{"name": "a", "url": "ftp://example.com/a"}]"#),
             &with(r#""inputs": [{"name": "a", "url": "file://"}]"#),
             &with(r#""inputs": [{"name": "../a", "url": "file:///a"}]"#),
             &with(r#""inputs": [{"name": "a/b", "url": "file:///a"}]"#),
@@ -243,6 +258,26 @@ mod tests {
         ] {
             assert!(JobDescription::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn input_sources() {
+        let job = JobDescription::parse(&with(
+            r#""inputs": [{"name": "a", "url": "https://example.com/a"}, {"name": "b", "url": "http://h/b"}]"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            job.inputs[0].source,
+            InputSource::Url("https://example.com/a".into())
+        );
+        assert_eq!(job.inputs[1].source, InputSource::Url("http://h/b".into()));
+        assert!(!job.has_local_inputs());
+
+        let job = JobDescription::parse(&with(
+            r#""inputs": [{"name": "a", "url": "file:///tmp/a"}]"#,
+        ))
+        .unwrap();
+        assert!(job.has_local_inputs());
     }
 
     #[test]

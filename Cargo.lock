@@ -24,6 +24,7 @@ version = "0.1.0"
 dependencies = [
  "ci_container",
  "ci_json",
+ "ci_protocol",
  "ci_tar",
 ]
 
@@ -34,6 +35,18 @@ dependencies = [
  "ci_http",
  "ci_json",
  "ci_tar",
+]
+
+[[package]]
+name = "ci_coordinator"
+version = "0.1.0"
+dependencies = [
+ "ci_crypto",
+ "ci_http",
+ "ci_json",
+ "ci_net",
+ "ci_postgres",
+ "ci_protocol",
 ]
 
 [[package]]
@@ -64,6 +77,13 @@ name = "ci_postgres"
 version = "0.1.0"
 dependencies = [
  "ci_crypto",
+]
+
+[[package]]
+name = "ci_protocol"
+version = "0.1.0"
+dependencies = [
+ "ci_json",
 ]
 
 [[package]]

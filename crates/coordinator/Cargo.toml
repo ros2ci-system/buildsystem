@@ -1,0 +1,22 @@
+[package]
+name = "ci_coordinator"
+description = "The coordinator: holds the job queue and hands jobs to workers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "ci-coordinator"
+path = "src/main.rs"
+
+[dependencies]
+ci_crypto = { path = "../crypto" }
+ci_http = { path = "../http" }
+ci_json = { path = "../json" }
+ci_net = { path = "../net" }
+ci_postgres = { path = "../postgres" }
+ci_protocol = { path = "../protocol" }
+
+[lints]
+workspace = true

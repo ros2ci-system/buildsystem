@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 ci_container = { path = "../container" }
 ci_json = { path = "../json" }
+ci_protocol = { path = "../protocol" }
 ci_tar = { path = "../tar" }
 
 [lints]

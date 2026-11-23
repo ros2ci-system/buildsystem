@@ -8,6 +8,8 @@ members = [
     "crates/net",
     "crates/container",
     "crates/postgres",
+    "crates/protocol",
+    "crates/coordinator",
     "crates/agent",
 ]
 

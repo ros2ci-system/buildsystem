@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use ci_container::{Client, ContainerSpec};
 use ci_json::Value;
 
-use crate::job::{InputSource, JobDescription};
+use ci_protocol::{InputSource, JobDescription, Outcome};
 
 /// The exit code a job uses to say "this failed for a reason outside the
 /// code under test; try again". It is `EX_TEMPFAIL` from `sysexits.h`.
@@ -36,28 +36,6 @@ pub const EXIT_INFRASTRUCTURE: i64 = 75;
 
 /// How often the container's state is checked while it runs.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Outcome {
-    Success,
-    /// The job ran and failed.
-    BuildFailure,
-    /// The job ran past its timeout and was killed.
-    Timeout,
-    /// The job could not be run, or said its failure was not its own.
-    InfrastructureFailure,
-}
-
-impl Outcome {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Outcome::Success => "success",
-            Outcome::BuildFailure => "build_failure",
-            Outcome::Timeout => "timeout",
-            Outcome::InfrastructureFailure => "infrastructure_failure",
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct JobResult {
@@ -327,6 +305,12 @@ fn build_upload_archive(job: &JobDescription, path: &Path) -> Result<(), String>
     builder.append_dir("job/in", 0o755).map_err(err)?;
     for input in &job.inputs {
         match &input.source {
+            InputSource::Url(url) => {
+                return Err(format!(
+                    "input {}: downloading {url} is not supported yet",
+                    input.name
+                ));
+            }
             InputSource::LocalFile(source) => {
                 let mut file = File::open(source)
                     .map_err(|e| format!("input {}: {}: {e}", input.name, source.display()))?;
