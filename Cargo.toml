@@ -1,10 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/crypto",
     "crates/json",
     "crates/tar",
     "crates/http",
     "crates/container",
+    "crates/postgres",
     "crates/agent",
 ]
 

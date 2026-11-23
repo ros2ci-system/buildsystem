@@ -9,7 +9,8 @@ is connected to the ROS build farm or to any official ROS infrastructure.**
 ## Rules for the code
 
 - Written in Rust.
-- No third-party crates. The one planned exception is `rustls` for TLS.
+- No third-party crates, with one exception: `rustls` for TLS, and `ring`, the
+  cryptography provider it is built with, for hashing.
 - No shelling out to other programs, and no FFI, where it can be avoided.
   Docker and Podman are reached through their HTTP API.
 
@@ -17,10 +18,12 @@ is connected to the ROS build farm or to any official ROS infrastructure.**
 
 | Crate | What it is |
 |---|---|
+| `crates/crypto` | Hashing and random numbers (from `ring`), base64 and hex |
 | `crates/json` | JSON parser and serializer |
 | `crates/tar` | tar archive reader and writer |
 | `crates/http` | HTTP/1.1 client over any byte stream |
 | `crates/container` | Client for the Docker and Podman HTTP API, over a Unix socket or a Windows named pipe |
+| `crates/postgres` | PostgreSQL client: wire protocol, SCRAM-SHA-256 login, parameterised queries |
 | `crates/agent` | The worker agent, `ci-agent` |
 
 So far the agent has one command, which runs a single job in a container:
@@ -69,16 +72,15 @@ docker build -f ci/Dockerfile.test -t buildsystem-test .
 docker run --rm buildsystem-test
 ```
 
-Some tests run real jobs and need a container runtime. They are skipped unless
-`CI_CONTAINER_RUNTIME` is set. To run them, give the test container the
-runtime's socket:
+Some tests need a service, and are skipped unless an environment variable says
+where it is:
 
-```
-docker run --rm \
-    -v /var/run/docker.sock:/var/run/docker.sock \
-    -e CI_CONTAINER_RUNTIME=unix:///var/run/docker.sock \
-    buildsystem-test
-```
+| Variable | Service | Tests |
+|---|---|---|
+| `CI_CONTAINER_RUNTIME` | A container runtime's socket | The agent running real jobs |
+| `CI_POSTGRES_URL` | A PostgreSQL server | The database client |
+
+The comment at the top of `ci/Dockerfile.test` shows how to supply both.
 
 Without a container, the same checks are:
 
@@ -95,6 +97,7 @@ cargo test --workspace
 | Podman on Linux | Tested |
 | Docker on Linux | Run by the GitHub workflow |
 | Docker on Windows 11, Windows containers with process isolation | Tested |
+| PostgreSQL 17 | Tested |
 
 On Windows there is no test Dockerfile yet. The tests run on the host:
 

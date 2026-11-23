@@ -1,0 +1,13 @@
+[package]
+name = "ci_postgres"
+description = "PostgreSQL client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ci_crypto = { path = "../crypto" }
+
+[lints]
+workspace = true

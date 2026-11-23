@@ -6,12 +6,19 @@
 #   docker build -f ci/Dockerfile.test -t buildsystem-test .
 #   docker run --rm buildsystem-test
 #
-# To also run the tests that need a container runtime, give the container
-# the runtime's socket:
+# Some tests need a service and are skipped unless told where it is:
 #
-#   docker run --rm \
+#   CI_CONTAINER_RUNTIME  a container runtime's socket, for the agent tests
+#   CI_POSTGRES_URL       a PostgreSQL server, for the database client tests
+#
+# For example, with Docker:
+#
+#   docker run -d --name test-postgres --network host \
+#       -e POSTGRES_PASSWORD=test docker.io/library/postgres:17
+#   docker run --rm --network host \
 #       -v /var/run/docker.sock:/var/run/docker.sock \
 #       -e CI_CONTAINER_RUNTIME=unix:///var/run/docker.sock \
+#       -e CI_POSTGRES_URL=postgres://postgres:test@127.0.0.1:5432/postgres \
 #       buildsystem-test
 #
 # Podman works the same way with its own socket path.
@@ -23,6 +30,10 @@ RUN rustup component add rustfmt clippy
 
 WORKDIR /src
 COPY . .
+
+# Third-party crates (rustls and what it needs) are downloaded here, once.
+# Everything after this line works without the network.
+RUN cargo fetch --locked
 
 # Compile at image build time, so that running the image only runs tests.
 RUN cargo build --workspace --all-targets --locked --offline
