@@ -94,7 +94,14 @@ cargo test --workspace
 |---|---|
 | Podman on Linux | Tested |
 | Docker on Linux | Run by the GitHub workflow |
-| Docker on Windows (Windows containers) | Not tested yet |
+| Docker on Windows 11, Windows containers with process isolation | Tested |
+
+On Windows there is no test Dockerfile yet. The tests run on the host:
+
+```
+$env:CI_CONTAINER_RUNTIME = "npipe:////./pipe/docker_engine"
+cargo test --workspace
+```
 
 ## License
 

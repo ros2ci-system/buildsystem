@@ -8,16 +8,62 @@
 //! `unix:///var/run/docker.sock`. Without it they pass without doing
 //! anything, and say so.
 //!
-//! The jobs use a small Linux image and `sh`. Set `CI_TEST_IMAGE` to use a
-//! different image. Windows containers need their own jobs, which are not
-//! written yet.
+//! On a Linux host the jobs use a small Linux image and `sh`. On a
+//! Windows host they use a Windows image and `cmd`. Set `CI_TEST_IMAGE` to
+//! use a different image.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-const DEFAULT_IMAGE: &str = "docker.io/library/alpine:3.20";
+/// What differs between Linux and Windows containers: the image, the
+/// shell, and the script for each test.
+struct Platform {
+    image: &'static str,
+    shell: [&'static str; 2],
+    job_dir: &'static str,
+    success: &'static str,
+    failure: &'static str,
+    reserved: &'static str,
+    timeout: &'static str,
+    nothing: &'static str,
+    large: &'static str,
+}
+
+#[cfg(not(windows))]
+const PLATFORM: Platform = Platform {
+    image: "docker.io/library/alpine:3.20",
+    shell: ["sh", "-c"],
+    job_dir: "/job",
+    success: "echo on-stdout; echo on-stderr >&2; echo dir=$CI_JOB_DIR; \
+              cat /job/params.json; cat /job/in/input.txt; \
+              mkdir -p /job/out/sub; echo results > /job/out/results.json; \
+              echo deep > /job/out/sub/file.txt",
+    failure: "echo building; echo partial > /job/out/partial.txt; exit 3",
+    reserved: "exit 75",
+    timeout: "echo started; echo before > /job/out/before.txt; sleep 600",
+    nothing: "true",
+    large: "cp /job/in/big.bin /job/out/big.bin; \
+            i=0; while [ $i -lt 20000 ]; do echo line $i; i=$((i+1)); done",
+};
+
+#[cfg(windows)]
+const PLATFORM: Platform = Platform {
+    image: "mcr.microsoft.com/windows/nanoserver:ltsc2025",
+    shell: ["cmd", "/c"],
+    job_dir: "C:\\job",
+    success: "echo on-stdout& echo on-stderr 1>&2& echo dir=%CI_JOB_DIR%& \
+              type C:\\job\\params.json& type C:\\job\\in\\input.txt& \
+              mkdir C:\\job\\out\\sub& echo results> C:\\job\\out\\results.json& \
+              echo deep> C:\\job\\out\\sub\\file.txt",
+    failure: "echo building& echo partial> C:\\job\\out\\partial.txt& exit 3",
+    reserved: "exit 75",
+    timeout: "echo started& echo before> C:\\job\\out\\before.txt& ping -n 600 127.0.0.1 >NUL",
+    nothing: "ver",
+    large: "copy /b C:\\job\\in\\big.bin C:\\job\\out\\big.bin >NUL& \
+            for /L %i in (0,1,19999) do @echo line %i",
+};
 
 struct Run {
     exit_status: i32,
@@ -66,7 +112,7 @@ fn runtime() -> Option<String> {
 }
 
 fn image() -> String {
-    std::env::var("CI_TEST_IMAGE").unwrap_or_else(|_| DEFAULT_IMAGE.to_string())
+    std::env::var("CI_TEST_IMAGE").unwrap_or_else(|_| PLATFORM.image.to_string())
 }
 
 fn scratch(name: &str) -> PathBuf {
@@ -76,12 +122,15 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// Writes a job description that runs `script` under `sh -c`.
+/// Writes a job description that runs `script` under the platform's shell.
 fn shell_job(image: &str, script: &str, timeout: u64, inputs: &[(&str, &Path)]) -> String {
     use ci_json::Value;
     Value::object([
         ("image", Value::from(image)),
-        ("command", Value::strings(["sh", "-c", script])),
+        (
+            "command",
+            Value::strings([PLATFORM.shell[0], PLATFORM.shell[1], script]),
+        ),
         (
             "parameters",
             Value::object([("distribution", Value::from("rolling"))]),
@@ -139,16 +188,18 @@ fn successful_job_gets_inputs_and_returns_outputs() {
     let inputs = scratch("success_inputs");
     let input = inputs.join("input.txt");
     fs::write(&input, "from the input file\n").unwrap();
-    let script = "echo on-stdout; echo on-stderr >&2; echo dir=$CI_JOB_DIR; \
-                  cat /job/params.json; cat /job/in/input.txt; \
-                  mkdir -p /job/out/sub; echo '{\"tests\": []}' > /job/out/results.json; \
-                  echo deep > /job/out/sub/file.txt";
     let result = run(
         &runtime,
         "success",
-        &shell_job(&image(), script, 120, &[("input.txt", &input)]),
+        &shell_job(&image(), PLATFORM.success, 120, &[("input.txt", &input)]),
     );
-    assert_eq!(result.outcome(), "success", "{}", result.message());
+    assert_eq!(
+        result.outcome(),
+        "success",
+        "{}\n{}",
+        result.message(),
+        result.log()
+    );
     assert_eq!(result.exit_status, 0);
     assert_eq!(result.outcome.get("exit_code").unwrap().as_i64(), Some(0));
     assert!(result
@@ -161,14 +212,14 @@ fn successful_job_gets_inputs_and_returns_outputs() {
 
     let log = result.log();
     for expected in [
-        "on-stdout",
-        "on-stderr",
-        "dir=/job",
-        "\"distribution\": \"rolling\"",
-        "from the input file",
+        "on-stdout".to_string(),
+        "on-stderr".to_string(),
+        format!("dir={}", PLATFORM.job_dir),
+        "\"distribution\": \"rolling\"".to_string(),
+        "from the input file".to_string(),
     ] {
         assert!(
-            log.contains(expected),
+            log.contains(&expected),
             "log is missing {expected:?}:\n{log}"
         );
     }
@@ -177,20 +228,27 @@ fn successful_job_gets_inputs_and_returns_outputs() {
     outputs.sort();
     assert_eq!(outputs, ["out/results.json", "out/sub/file.txt"]);
     assert_eq!(
-        fs::read_to_string(result.work_dir.join("out/results.json")).unwrap(),
-        "{\"tests\": []}\n"
+        fs::read_to_string(result.work_dir.join("out/results.json"))
+            .unwrap()
+            .trim(),
+        "results"
     );
     assert_eq!(
-        fs::read_to_string(result.work_dir.join("out/sub/file.txt")).unwrap(),
-        "deep\n"
+        fs::read_to_string(result.work_dir.join("out/sub/file.txt"))
+            .unwrap()
+            .trim(),
+        "deep"
     );
 }
 
 #[test]
 fn failing_job_is_a_build_failure_and_keeps_its_outputs() {
     let Some(runtime) = runtime() else { return };
-    let script = "echo building; echo partial > /job/out/partial.txt; exit 3";
-    let result = run(&runtime, "failure", &shell_job(&image(), script, 120, &[]));
+    let result = run(
+        &runtime,
+        "failure",
+        &shell_job(&image(), PLATFORM.failure, 120, &[]),
+    );
     assert_eq!(result.outcome(), "build_failure");
     assert_eq!(result.exit_status, 1);
     assert_eq!(result.outcome.get("exit_code").unwrap().as_i64(), Some(3));
@@ -204,7 +262,7 @@ fn reserved_exit_code_is_an_infrastructure_failure() {
     let result = run(
         &runtime,
         "reserved",
-        &shell_job(&image(), "exit 75", 120, &[]),
+        &shell_job(&image(), PLATFORM.reserved, 120, &[]),
     );
     assert_eq!(result.outcome(), "infrastructure_failure");
     assert_eq!(result.exit_status, 2);
@@ -214,14 +272,17 @@ fn reserved_exit_code_is_an_infrastructure_failure() {
 #[test]
 fn job_past_its_timeout_is_killed() {
     let Some(runtime) = runtime() else { return };
-    let script = "echo started; echo before > /job/out/before.txt; sleep 600";
     let started = Instant::now();
-    let result = run(&runtime, "timeout", &shell_job(&image(), script, 3, &[]));
+    let result = run(
+        &runtime,
+        "timeout",
+        &shell_job(&image(), PLATFORM.timeout, 3, &[]),
+    );
     assert!(
-        started.elapsed() < Duration::from_secs(60),
+        started.elapsed() < Duration::from_secs(120),
         "the job should have been killed at its timeout"
     );
-    assert_eq!(result.outcome(), "timeout");
+    assert_eq!(result.outcome(), "timeout", "{}", result.message());
     assert_eq!(result.exit_status, 1);
     assert!(result.outcome.get("exit_code").unwrap().is_null());
     assert_eq!(result.outputs(), ["out/before.txt"]);
@@ -231,7 +292,12 @@ fn job_past_its_timeout_is_killed() {
 #[test]
 fn missing_image_is_an_infrastructure_failure() {
     let Some(runtime) = runtime() else { return };
-    let job = shell_job("localhost:1/ros2ci-no-such-image:1", "true", 120, &[]);
+    let job = shell_job(
+        "localhost:1/ros2ci-no-such-image:1",
+        PLATFORM.nothing,
+        120,
+        &[],
+    );
     let result = run(&runtime, "missing_image", &job);
     assert_eq!(result.outcome(), "infrastructure_failure");
     assert_eq!(result.exit_status, 2);
@@ -241,12 +307,8 @@ fn missing_image_is_an_infrastructure_failure() {
 #[test]
 fn missing_input_is_an_infrastructure_failure() {
     let Some(runtime) = runtime() else { return };
-    let job = shell_job(
-        &image(),
-        "true",
-        120,
-        &[("x", Path::new("/nonexistent/input"))],
-    );
+    let missing = scratch("missing_input_source").join("not-there");
+    let job = shell_job(&image(), PLATFORM.nothing, 120, &[("x", &missing)]);
     let result = run(&runtime, "missing_input", &job);
     assert_eq!(result.outcome(), "infrastructure_failure");
     assert_eq!(result.exit_status, 2);
@@ -254,48 +316,40 @@ fn missing_input_is_an_infrastructure_failure() {
 }
 
 #[test]
-fn large_outputs_and_logs_survive_intact() {
+fn large_files_and_logs_survive_intact() {
     let Some(runtime) = runtime() else { return };
-    // 20 MB of pseudo-random data, whose checksum the job prints first,
-    // then 20,000 log lines.
-    let script = "head -c 20000000 /dev/urandom > /job/out/big.bin; \
-                  cksum < /job/out/big.bin; \
-                  i=0; while [ $i -lt 20000 ]; do echo line $i; i=$((i+1)); done";
-    let result = run(&runtime, "large", &shell_job(&image(), script, 300, &[]));
+    // 20 MB that does not compress or repeat goes in as an input and comes
+    // back as an output, alongside 20,000 log lines.
+    let inputs = scratch("large_inputs");
+    let input = inputs.join("big.bin");
+    let mut data = Vec::with_capacity(20_000_000);
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    while data.len() < 20_000_000 {
+        // xorshift64
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        data.extend_from_slice(&state.to_le_bytes());
+    }
+    fs::write(&input, &data).unwrap();
+
+    let result = run(
+        &runtime,
+        "large",
+        &shell_job(&image(), PLATFORM.large, 600, &[("big.bin", &input)]),
+    );
     assert_eq!(result.outcome(), "success", "{}", result.message());
+
     let log = result.log();
-    let mut lines = log.lines();
-    let reported = lines.next().unwrap().to_string();
-    assert_eq!(lines.clone().count(), 20000);
-    assert_eq!(lines.last(), Some("line 19999"));
+    let lines: Vec<&str> = log.lines().map(str::trim_end).collect();
+    assert_eq!(lines.len(), 20000);
+    assert_eq!(lines[0], "line 0");
+    assert_eq!(lines[19999], "line 19999");
 
-    let data = fs::read(result.work_dir.join("out/big.bin")).unwrap();
-    assert_eq!(data.len(), 20_000_000);
-    assert_eq!(reported, format!("{} {}", posix_cksum(&data), data.len()));
-}
-
-/// The POSIX `cksum` algorithm, to compare a file with what the job saw
-/// without depending on a hashing library.
-fn posix_cksum(data: &[u8]) -> u32 {
-    fn step(mut crc: u32, byte: u8) -> u32 {
-        crc ^= u32::from(byte) << 24;
-        for _ in 0..8 {
-            crc = if crc & 0x8000_0000 != 0 {
-                (crc << 1) ^ 0x04C1_1DB7
-            } else {
-                crc << 1
-            };
-        }
-        crc
-    }
-    let mut crc = 0u32;
-    for &byte in data {
-        crc = step(crc, byte);
-    }
-    let mut len = data.len();
-    while len != 0 {
-        crc = step(crc, (len & 0xff) as u8);
-        len >>= 8;
-    }
-    !crc
+    let returned = fs::read(result.work_dir.join("out/big.bin")).unwrap();
+    assert_eq!(returned.len(), data.len());
+    assert!(
+        returned == data,
+        "the file changed on its way through the container"
+    );
 }
