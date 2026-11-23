@@ -398,9 +398,16 @@ fn run_in_container(
     let mut timed_out = false;
     let mut stopped = false;
     let state = loop {
+        let asked = Instant::now();
         let state = client
             .inspect_container(id)
             .map_err(|e| format!("checking the container: {e}"))?;
+        if asked.elapsed() > SLOW_STEP {
+            eprintln!(
+                "note: the runtime took {:.1} s to report on container {id}",
+                asked.elapsed().as_secs_f64()
+            );
+        }
         if !state.running {
             break state;
         }
@@ -421,21 +428,21 @@ fn run_in_container(
     };
     collected.image_id = state.image_id.clone();
 
-    // The log stream ends when the container stops.
-    match log_thread.join() {
-        Ok(Ok(())) => {}
-        Ok(Err(message)) => return Err(message),
-        Err(_) => return Err("the log thread panicked".to_string()),
-    }
-
-    // Outputs are collected whatever the outcome: a failed build's logs
-    // and partial results are the ones people most want to see.
-    let mut archive = client
-        .download_archive(id, layout.out_dir)
-        .map_err(|e| format!("copying outputs out of the container: {e}"))?;
-    collected.outputs = ci_tar::Archive::new(&mut archive)
-        .unpack(work_dir)
-        .map_err(|e| format!("copying outputs out of the container: {e}"))?;
+    // Collecting the log and the outputs can take a while. It happens on
+    // another thread, so that this one keeps calling the monitor and the
+    // job stays claimed until its results are in hand.
+    let collected_outputs = thread::scope(|scope| {
+        let work =
+            scope.spawn(|| collect_after_exit(client, id, layout.out_dir, work_dir, log_thread));
+        while !work.is_finished() {
+            // A request to stop means nothing now: the job has ended.
+            let _ = monitor();
+            thread::sleep(POLL_INTERVAL);
+        }
+        work.join()
+            .unwrap_or_else(|_| Err("collecting the job's results panicked".to_string()))
+    })?;
+    collected.outputs = collected_outputs;
 
     if stopped {
         return Ok(Finished::Stopped);
@@ -450,6 +457,67 @@ fn run_in_container(
         return Err("the container was killed for running out of memory".to_string());
     }
     Ok(Finished::Exited(state.exit_code))
+}
+
+/// How long to wait, after the container has stopped, for the runtime to
+/// close the container's log stream.
+const LOG_DRAIN_LIMIT: Duration = Duration::from_secs(30);
+
+/// A step slower than this is worth a line in the agent's own log.
+const SLOW_STEP: Duration = Duration::from_secs(5);
+
+/// Finishes the log and copies the outputs out of a stopped container.
+/// Returns the output files, relative to the work directory.
+fn collect_after_exit(
+    client: &Client,
+    id: &str,
+    out_dir: &str,
+    work_dir: &Path,
+    log_thread: thread::JoinHandle<Result<(), String>>,
+) -> Result<Vec<PathBuf>, String> {
+    // The log stream should end when the container stops. If the runtime
+    // leaves it open, waiting for ever would lose the whole job, so the
+    // log is taken as it stands.
+    let started = Instant::now();
+    while !log_thread.is_finished() && started.elapsed() < LOG_DRAIN_LIMIT {
+        thread::sleep(Duration::from_millis(100));
+    }
+    if log_thread.is_finished() {
+        match log_thread.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(message)) => return Err(message),
+            Err(_) => return Err("the log thread panicked".to_string()),
+        }
+    } else {
+        eprintln!(
+            "warning: the runtime did not close the log of container {id} within {} seconds of its exit; \
+             the end of the log may be missing",
+            LOG_DRAIN_LIMIT.as_secs()
+        );
+    }
+    if started.elapsed() > SLOW_STEP {
+        eprintln!(
+            "note: finishing the container's log took {:.1} s",
+            started.elapsed().as_secs_f64()
+        );
+    }
+
+    // Outputs are collected whatever the outcome: a failed build's logs
+    // and partial results are the ones people most want to see.
+    let started = Instant::now();
+    let mut archive = client
+        .download_archive(id, out_dir)
+        .map_err(|e| format!("copying outputs out of the container: {e}"))?;
+    let outputs = ci_tar::Archive::new(&mut archive)
+        .unpack(work_dir)
+        .map_err(|e| format!("copying outputs out of the container: {e}"))?;
+    if started.elapsed() > SLOW_STEP {
+        eprintln!(
+            "note: copying the outputs out took {:.1} s",
+            started.elapsed().as_secs_f64()
+        );
+    }
+    Ok(outputs)
 }
 
 enum Built {
