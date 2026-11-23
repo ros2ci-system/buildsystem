@@ -9,7 +9,7 @@
 //! | Call | When | Reply |
 //! |---|---|---|
 //! | Register | Once at start-up | A worker id and a session token |
-//! | Claim | Every few seconds while idle | A job, or nothing |
+//! | Claim | Every few seconds while idle | A job, nothing, or shut down |
 //! | Report | Every few seconds while a job runs | Carry on, cancel or abandon |
 //! | Finish | Once per job | An acknowledgement |
 //!
@@ -17,6 +17,10 @@
 //! Each claim gets a new attempt number, and every later call carries it,
 //! so a worker that lost its lease cannot finish a job that another
 //! worker now holds.
+//!
+//! A Claim answered with `"shut_down": true` tells the worker to stop. It
+//! is sent to a worker an administrator is draining. Workers only claim
+//! while idle, so a draining worker finishes its job first.
 
 pub mod job;
 

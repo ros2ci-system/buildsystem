@@ -83,6 +83,11 @@ How it behaves:
   it delays jobs but loses nothing, and running jobs carry on.
 - **One coordinator.** A second coordinator pointed at the same database
   refuses to start.
+- **Draining.** `ci-admin drain-worker <worker-id>` stops a worker cleanly:
+  it finishes the job it is running, is given no more, and its agent exits
+  with status 0. `ci-admin list-workers` shows the worker ids. An agent that
+  is started again registers as a new worker and takes jobs as usual; to keep
+  a machine out for good, revoke its token.
 
 An agent can also run a single job with no coordinator:
 

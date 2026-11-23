@@ -24,6 +24,13 @@ Commands:
   revoke-worker-token <token-id>
       Revokes a worker's enrolment token. Workers that registered with it
       are refused from then on.
+  list-workers
+      Lists the registered workers: id, pool, platform, when each last
+      called, the job it is running, and whether it is draining.
+  drain-worker <worker-id>
+      Stops a worker cleanly. It finishes the job it is running, takes no
+      more, and its agent exits with status 0. An agent that is started
+      again registers as a new worker and takes jobs as usual.
   create-admin-token --name <text>
       Issues another admin token and prints it. Give each person or
       service its own, so that the coordinator's log says who did what.
@@ -367,6 +374,53 @@ fn run(admin: &Admin, command: &str, args: &[String]) -> Result<ExitCode, String
                 reply.get("sha256").and_then(Value::as_str).unwrap_or("?"),
                 reply.get("name").and_then(Value::as_str).unwrap_or(name)
             );
+            Ok(ExitCode::SUCCESS)
+        }
+        "list-workers" => {
+            let (options, positional) = parse_args(args, &[])?;
+            only_options(&options, &[])?;
+            if !positional.is_empty() {
+                return Err(format!("unexpected argument {:?}", positional[0]));
+            }
+            let reply = admin.json("GET", "/admin/v1/workers", None)?;
+            println!(
+                "{:>6}  {:<16} {:<16} {:<20}  {:>6}  STATE  TOKEN",
+                "WORKER", "POOL", "PLATFORM", "LAST SEEN", "JOB"
+            );
+            for worker in reply
+                .get("workers")
+                .and_then(Value::as_array)
+                .unwrap_or(&[])
+            {
+                let text = |key: &str| worker.get(key).and_then(Value::as_str).unwrap_or("?");
+                let draining = worker.get("draining") == Some(&Value::Bool(true));
+                println!(
+                    "{:>6}  {:<16} {:<16} {:<20}  {:>6}  {:<8} {} ({})",
+                    worker.get("worker_id").and_then(Value::as_i64).unwrap_or(0),
+                    text("pool"),
+                    format!("{}/{}", text("os"), text("arch")),
+                    text("last_seen_at"),
+                    worker
+                        .get("job_id")
+                        .and_then(Value::as_i64)
+                        .map_or("-".to_string(), |id| id.to_string()),
+                    if draining { "draining" } else { "active" },
+                    worker.get("token_id").and_then(Value::as_i64).unwrap_or(0),
+                    text("token_name"),
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        "drain-worker" => {
+            let (options, positional) = parse_args(args, &[])?;
+            only_options(&options, &[])?;
+            let id = positional
+                .first()
+                .and_then(|text| text.parse::<i64>().ok())
+                .filter(|id| *id > 0)
+                .ok_or("a worker id is required")?;
+            admin.json("POST", &format!("/admin/v1/workers/{id}/drain"), None)?;
+            eprintln!("worker {id} is draining");
             Ok(ExitCode::SUCCESS)
         }
         "list-files" => {

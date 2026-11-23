@@ -86,6 +86,8 @@ const MIGRATIONS: &[&str] = &[
         sha256 text NOT NULL,
         updated_at timestamptz NOT NULL DEFAULT now()
     );",
+    // 4: workers that have been asked to stop once they are idle.
+    "ALTER TABLE workers ADD COLUMN draining boolean NOT NULL DEFAULT false;",
 ];
 
 const TIMESTAMP: &str = "'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'";
@@ -101,6 +103,24 @@ pub struct Worker {
     pub pool: String,
     pub os: String,
     pub arch: String,
+    /// An administrator asked this worker to stop once it is idle.
+    pub draining: bool,
+}
+
+/// A worker as the admin API lists it.
+#[derive(Debug, Clone)]
+pub struct WorkerStatus {
+    pub id: i64,
+    pub token_id: i64,
+    pub token_name: String,
+    pub pool: String,
+    pub os: String,
+    pub arch: String,
+    pub registered_at: String,
+    pub last_seen_at: String,
+    pub draining: bool,
+    /// The job it is running, if any.
+    pub job_id: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -371,7 +391,7 @@ impl Db {
                 "INSERT INTO workers (token_id, session_hash, pool, os, arch)
                  SELECT id, $2, pool, $3, $4 FROM worker_tokens
                  WHERE token_hash = $1 AND NOT revoked
-                 RETURNING id, pool, os, arch",
+                 RETURNING id, pool, os, arch, draining",
                 &[
                     token_hash.into(),
                     session_hash.into(),
@@ -392,10 +412,58 @@ impl Db {
                 "UPDATE workers SET last_seen_at = now()
                  WHERE session_hash = $1
                    AND NOT (SELECT revoked FROM worker_tokens WHERE id = workers.token_id)
-                 RETURNING id, pool, os, arch",
+                 RETURNING id, pool, os, arch, draining",
                 &[session_hash.into()],
             )?;
             rows.first().map(worker_from_row).transpose()
+        })
+    }
+
+    /// Marks a worker as draining: it is given no more jobs, and is told
+    /// to shut down the next time it asks for one. Returns `false` when
+    /// there is no such worker. Draining a worker twice is not an error.
+    pub fn drain_worker(&self, id: i64) -> Result<bool, Error> {
+        self.with(|c| {
+            Ok(c.execute(
+                "UPDATE workers SET draining = true WHERE id = $1",
+                &[id.into()],
+            )? > 0)
+        })
+    }
+
+    /// Every worker whose enrolment token still stands, newest first.
+    pub fn workers(&self) -> Result<Vec<WorkerStatus>, Error> {
+        self.with(|c| {
+            c.query(
+                &format!(
+                    "SELECT w.id, t.id, t.name, w.pool, w.os, w.arch,
+                            to_char(w.registered_at AT TIME ZONE 'UTC', {TIMESTAMP}),
+                            to_char(w.last_seen_at AT TIME ZONE 'UTC', {TIMESTAMP}),
+                            w.draining,
+                            (SELECT max(j.id) FROM jobs j
+                             WHERE j.state = 'running' AND j.worker_id = w.id)
+                     FROM workers w JOIN worker_tokens t ON t.id = w.token_id
+                     WHERE NOT t.revoked
+                     ORDER BY w.id DESC"
+                ),
+                &[],
+            )?
+            .iter()
+            .map(|row| {
+                Ok(WorkerStatus {
+                    id: row.int(0)?,
+                    token_id: row.int(1)?,
+                    token_name: row.text(2)?.to_string(),
+                    pool: row.text(3)?.to_string(),
+                    os: row.text(4)?.to_string(),
+                    arch: row.text(5)?.to_string(),
+                    registered_at: row.text(6)?.to_string(),
+                    last_seen_at: row.text(7)?.to_string(),
+                    draining: row.bool(8)?,
+                    job_id: row.opt_int(9)?,
+                })
+            })
+            .collect()
         })
     }
 
@@ -730,6 +798,7 @@ fn worker_from_row(row: &Row) -> Result<Worker, Error> {
         pool: row.text(1)?.to_string(),
         os: row.text(2)?.to_string(),
         arch: row.text(3)?.to_string(),
+        draining: row.bool(4)?,
     })
 }
 

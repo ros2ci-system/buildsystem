@@ -61,8 +61,9 @@ struct Claimed {
 type Reply = (u16, Value);
 
 impl Worker {
-    /// Runs until the process is killed. Returns only on an error that
-    /// trying again cannot fix, such as a refused enrolment token.
+    /// Runs until the coordinator tells the worker to shut down, which
+    /// returns `Ok`, or the process is killed. Returns an error only when
+    /// trying again cannot fix it, such as a refused enrolment token.
     pub fn run(&self) -> Result<(), String> {
         fs::create_dir_all(&self.work_dir)
             .map_err(|e| format!("cannot create {}: {e}", self.work_dir.display()))?;
@@ -75,8 +76,12 @@ impl Worker {
                 Ok((200, reply)) => {
                     failures = 0;
                     match parse_claim(&reply) {
-                        Ok(Some(job)) => self.run_claimed(&session, &identity, job),
-                        Ok(None) => thread::sleep(session.claim_interval),
+                        Ok(Claim::Job(job)) => self.run_claimed(&session, &identity, job),
+                        Ok(Claim::Nothing) => thread::sleep(session.claim_interval),
+                        Ok(Claim::ShutDown) => {
+                            eprintln!("the coordinator told this worker to shut down");
+                            return Ok(());
+                        }
                         Err(message) => {
                             eprintln!("warning: the coordinator's reply to Claim made no sense: {message}");
                             thread::sleep(session.claim_interval);
@@ -592,12 +597,23 @@ impl Reporter<'_> {
     }
 }
 
-fn parse_claim(reply: &Value) -> Result<Option<Claimed>, String> {
+/// What the coordinator answered a Claim with.
+enum Claim {
+    Job(Claimed),
+    Nothing,
+    /// The worker is being drained and has nothing left to do.
+    ShutDown,
+}
+
+fn parse_claim(reply: &Value) -> Result<Claim, String> {
     let job = reply.get("job").ok_or("no \"job\" member")?;
     if job.is_null() {
-        return Ok(None);
+        return Ok(match reply.get("shut_down") {
+            Some(Value::Bool(true)) => Claim::ShutDown,
+            _ => Claim::Nothing,
+        });
     }
-    Ok(Some(Claimed {
+    Ok(Claim::Job(Claimed {
         job_id: job
             .get("job_id")
             .and_then(Value::as_i64)
@@ -682,15 +698,21 @@ mod tests {
 
     #[test]
     fn claim_replies() {
-        assert!(parse_claim(&ci_json::parse(r#"{"job": null}"#).unwrap())
-            .unwrap()
-            .is_none());
-        let job = parse_claim(
-            &ci_json::parse(r#"{"job": {"job_id": 7, "attempt": 2, "description": {"x": 1}, "report_interval_seconds": 5}}"#)
-                .unwrap(),
-        )
-        .unwrap()
-        .unwrap();
+        let claim = |text: &str| parse_claim(&ci_json::parse(text).unwrap());
+        assert!(matches!(claim(r#"{"job": null}"#), Ok(Claim::Nothing)));
+        assert!(matches!(
+            claim(r#"{"job": null, "shut_down": false}"#),
+            Ok(Claim::Nothing)
+        ));
+        assert!(matches!(
+            claim(r#"{"job": null, "shut_down": true}"#),
+            Ok(Claim::ShutDown)
+        ));
+        let Ok(Claim::Job(job)) = claim(
+            r#"{"job": {"job_id": 7, "attempt": 2, "description": {"x": 1}, "report_interval_seconds": 5}}"#,
+        ) else {
+            panic!("a job was expected");
+        };
         assert_eq!(
             (job.job_id, job.attempt, job.report_interval),
             (7, 2, Duration::from_secs(5))

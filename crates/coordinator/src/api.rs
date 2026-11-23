@@ -262,6 +262,15 @@ impl Coordinator {
     }
 
     fn claim(&self, worker: &Worker) -> Result<Response, Reject> {
+        // A draining worker only asks again after finishing what it had,
+        // so this is the moment it is idle and can stop.
+        if worker.draining {
+            eprintln!("worker {} told to shut down: it is draining", worker.id);
+            return Ok(json_ok(Value::object([
+                ("job", Value::Null),
+                ("shut_down", Value::Bool(true)),
+            ])));
+        }
         let Some(job) = self.db.claim_job(worker, self.settings.lease_seconds)? else {
             return Ok(json_ok(Value::object([("job", Value::Null)])));
         };
@@ -558,6 +567,17 @@ impl Coordinator {
                 eprintln!("admin {admin:?}: revoked worker token {id}");
                 Ok(json_ok(Value::object([("revoked", Value::Bool(true))])))
             }
+            ("GET", ["admin", "v1", "workers"]) => self.list_workers(),
+            ("POST", ["admin", "v1", "workers", id, "drain"]) => {
+                let id = id
+                    .parse::<i64>()
+                    .map_err(|_| reject(404, "no such worker"))?;
+                if !self.db.drain_worker(id)? {
+                    return Err(reject(404, "no such worker"));
+                }
+                eprintln!("admin {admin:?}: draining worker {id}");
+                Ok(json_ok(Value::object([("draining", Value::Bool(true))])))
+            }
             ("GET", ["admin", "v1", "files"]) => self.list_stored_files(),
             ("PUT", ["admin", "v1", "files", name]) => self.put_stored_file(&admin, name, request),
             ("DELETE", ["admin", "v1", "files", name]) => {
@@ -642,6 +662,32 @@ impl Coordinator {
             ])
             .to_json(),
         ))
+    }
+
+    fn list_workers(&self) -> Result<Response, Reject> {
+        let workers = self.db.workers()?;
+        Ok(json_ok(Value::object([(
+            "workers",
+            Value::Array(
+                workers
+                    .into_iter()
+                    .map(|w| {
+                        Value::object([
+                            ("worker_id", Value::Int(w.id)),
+                            ("token_id", Value::Int(w.token_id)),
+                            ("token_name", Value::from(w.token_name)),
+                            ("pool", Value::from(w.pool)),
+                            ("os", Value::from(w.os)),
+                            ("arch", Value::from(w.arch)),
+                            ("registered_at", Value::from(w.registered_at)),
+                            ("last_seen_at", Value::from(w.last_seen_at)),
+                            ("draining", Value::Bool(w.draining)),
+                            ("job_id", w.job_id.map_or(Value::Null, Value::Int)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        )])))
     }
 
     fn list_stored_files(&self) -> Result<Response, Reject> {

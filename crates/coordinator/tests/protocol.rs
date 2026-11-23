@@ -1392,6 +1392,62 @@ fn a_revoked_worker_token_shuts_its_workers_out() {
     );
 }
 
+#[test]
+fn a_draining_worker_is_told_to_shut_down_and_gets_no_jobs() {
+    let Some(c) = Coordinator::start(&[]) else {
+        return;
+    };
+    // Workers 1 and 2, in that order.
+    let draining = c.register("release", "linux", "amd64");
+    let other = c.register("release", "linux", "amd64");
+    let claim = |session: &str| {
+        let (status, reply) = c.worker("/worker/v1/claim", session, Value::object::<&str>([]));
+        assert_eq!(status, 200, "{reply:?}");
+        reply
+    };
+    let shut_down = |reply: &Value| reply.get("shut_down") == Some(&Value::Bool(true));
+
+    // A job the first worker holds when it is drained.
+    let held_id = c.submit("release", "linux", "amd64");
+    let held = c.claim(&draining).unwrap();
+    assert_eq!(held.0, held_id);
+    assert!(!shut_down(&claim(&other)));
+
+    assert_eq!(c.admin("POST", "/admin/v1/workers/1/drain", None).0, 200);
+    // Draining twice is not an error; an unknown worker is.
+    assert_eq!(c.admin("POST", "/admin/v1/workers/1/drain", None).0, 200);
+    assert_eq!(c.admin("POST", "/admin/v1/workers/99/drain", None).0, 404);
+    assert_eq!(c.admin("POST", "/admin/v1/workers/x/drain", None).0, 404);
+
+    // The job it holds is still its own: it can report and finish.
+    let (action, _) = c.report(&draining, held, 0, b"still working\n");
+    assert_eq!(action, "continue");
+    let (_, listing) = c.admin("GET", "/admin/v1/workers", None);
+    let workers = listing.get("workers").unwrap().as_array().unwrap();
+    assert_eq!(workers.len(), 2);
+    // Newest first.
+    assert_eq!(workers[0].get("worker_id").unwrap().as_i64(), Some(2));
+    assert_eq!(workers[0].get("draining"), Some(&Value::Bool(false)));
+    assert!(workers[0].get("job_id").unwrap().is_null());
+    assert_eq!(workers[1].get("worker_id").unwrap().as_i64(), Some(1));
+    assert_eq!(workers[1].get("draining"), Some(&Value::Bool(true)));
+    assert_eq!(workers[1].get("job_id").unwrap().as_i64(), Some(held_id));
+    assert_eq!(str_of(&workers[1], "pool"), "release");
+
+    // With a job waiting, the draining worker is told to stop and the
+    // job goes to the other worker.
+    let waiting = c.submit("release", "linux", "amd64");
+    let reply = claim(&draining);
+    assert!(shut_down(&reply), "{reply:?}");
+    assert!(reply.get("job").unwrap().is_null());
+    assert_eq!(str_of(&c.status(waiting), "state"), "queued");
+    assert_eq!(c.claim(&other).map(|job| job.0), Some(waiting));
+
+    // A worker that registers afresh is not draining.
+    let again = c.register("release", "linux", "amd64");
+    assert!(!shut_down(&claim(&again)));
+}
+
 fn build_job(context: &str, extra: &[(&str, Value)]) -> Value {
     let mut description = vec![
         (

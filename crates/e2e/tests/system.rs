@@ -108,6 +108,18 @@ fn free_port() -> u16 {
 struct Process(Child);
 
 impl Process {
+    /// Waits for the process to end by itself and returns its exit code.
+    fn wait_for_exit(&mut self, limit: Duration) -> Option<i32> {
+        let deadline = Instant::now() + limit;
+        loop {
+            if let Some(status) = self.0.try_wait().unwrap() {
+                return status.code();
+            }
+            assert!(Instant::now() < deadline, "the process did not exit");
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
+
     fn kill(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
@@ -776,6 +788,44 @@ fn pools_are_kept_apart() {
     system.start_agent("release");
     assert_eq!(
         str_of(&system.wait_finished(&release_job), "outcome"),
+        "success"
+    );
+}
+
+#[test]
+fn a_drained_agent_finishes_its_job_and_exits_cleanly() {
+    let Some(mut system) = System::start(false, &[]) else {
+        return;
+    };
+    let agent = system.start_agent("release");
+    let running = system.submit("release", PLATFORM.slow, 120, &[]);
+    system.wait_for_log(&running, "step 1");
+
+    // The only agent is worker 1. It is drained in the middle of a job,
+    // with another job waiting behind it.
+    let listing = system.admin_ok(&["list-workers"]);
+    assert!(listing.contains("active"), "{listing}");
+    system.admin_ok(&["drain-worker", "1"]);
+    let waiting = system.submit("release", "echo later", 120, &[]);
+    assert!(system.admin_ok(&["list-workers"]).contains("draining"));
+
+    // The job it was running finishes normally, then the agent exits
+    // with status 0 without taking the waiting job.
+    let done = system.wait_finished(&running);
+    assert_eq!(str_of(&done, "outcome"), "success");
+    assert_eq!(artifact_names(&done), ["result.txt"]);
+    assert_eq!(
+        system.agents[agent].wait_for_exit(Duration::from_secs(60)),
+        Some(0)
+    );
+    assert_eq!(str_of(&system.status(&waiting), "state"), "queued");
+    assert_no_job_directories(&system, agent);
+    assert!(!system.admin(&["drain-worker", "99"]).status.success());
+
+    // The same agent, started again, is a new worker and takes the job.
+    system.restart_agent("release", agent);
+    assert_eq!(
+        str_of(&system.wait_finished(&waiting), "outcome"),
         "success"
     );
 }
