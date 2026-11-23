@@ -6,8 +6,8 @@
 //!
 //! These tests need both `CI_POSTGRES_URL` and `CI_CONTAINER_RUNTIME`, and
 //! are skipped without them. They run the three programs from the build
-//! directory, so build the workspace first (`cargo build --workspace`);
-//! `cargo test --workspace` does that by itself.
+//! directory, and `cargo test` does not build all of them, so build the
+//! workspace first: `cargo build --workspace`.
 
 use std::fs;
 use std::net::{TcpListener, TcpStream};

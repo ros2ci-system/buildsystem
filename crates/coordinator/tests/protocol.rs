@@ -25,7 +25,7 @@ use ci_net::{Connector, Url};
 static NEXT: AtomicU32 = AtomicU32::new(0);
 
 struct Coordinator {
-    process: Child,
+    process: Option<Child>,
     worker_url: String,
     admin_url: String,
     database: String,
@@ -75,7 +75,7 @@ impl Coordinator {
         let data_dir = std::env::temp_dir().join(&database);
         let _ = fs::remove_dir_all(&data_dir);
         let mut coordinator = Coordinator {
-            process: Command::new("true").spawn().unwrap(),
+            process: None,
             worker_url: String::new(),
             admin_url: String::new(),
             database,
@@ -87,7 +87,7 @@ impl Coordinator {
         };
         coordinator.worker_url = format!("http://127.0.0.1:{}", coordinator.worker_port);
         coordinator.admin_url = format!("http://127.0.0.1:{}", coordinator.admin_port);
-        coordinator.process = coordinator.spawn();
+        coordinator.process = Some(coordinator.spawn());
         coordinator.wait_until_listening();
         Some(coordinator)
     }
@@ -121,13 +121,15 @@ impl Coordinator {
     }
 
     fn stop(&mut self) {
-        let _ = self.process.kill();
-        let _ = self.process.wait();
+        if let Some(mut process) = self.process.take() {
+            let _ = process.kill();
+            let _ = process.wait();
+        }
     }
 
     fn restart(&mut self) {
         self.stop();
-        self.process = self.spawn();
+        self.process = Some(self.spawn());
         self.wait_until_listening();
     }
 
@@ -1059,7 +1061,7 @@ fn a_restart_loses_nothing() {
     // The coordinator is down for longer than the lease.
     c.stop();
     thread::sleep(Duration::from_secs(4));
-    c.process = c.spawn();
+    c.process = Some(c.spawn());
     c.wait_until_listening();
 
     // The same session still works, the job is still this worker's, and

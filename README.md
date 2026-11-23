@@ -134,8 +134,11 @@ Without a container, the same checks are:
 ```
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
+cargo build --workspace
 cargo test --workspace
 ```
+
+The build comes first because the end-to-end tests run the built programs.
 
 ### What has been tested where
 
@@ -150,6 +153,8 @@ On Windows there is no test Dockerfile yet. The tests run on the host:
 
 ```
 $env:CI_CONTAINER_RUNTIME = "npipe:////./pipe/docker_engine"
+$env:CI_POSTGRES_URL = "postgres://user:password@host:5432/postgres"
+cargo build --workspace
 cargo test --workspace
 ```
 
