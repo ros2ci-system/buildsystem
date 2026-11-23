@@ -1,0 +1,19 @@
+[package]
+name = "ci_agent"
+description = "Worker agent: runs jobs in containers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "ci-agent"
+path = "src/main.rs"
+
+[dependencies]
+ci_container = { path = "../container" }
+ci_json = { path = "../json" }
+ci_tar = { path = "../tar" }
+
+[lints]
+workspace = true

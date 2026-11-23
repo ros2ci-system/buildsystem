@@ -1,0 +1,33 @@
+# Copyright 2026 The ros2ci authors
+# SPDX-License-Identifier: Apache-2.0
+
+# Runs the checks and tests for the whole workspace.
+#
+#   docker build -f ci/Dockerfile.test -t buildsystem-test .
+#   docker run --rm buildsystem-test
+#
+# To also run the tests that need a container runtime, give the container
+# the runtime's socket:
+#
+#   docker run --rm \
+#       -v /var/run/docker.sock:/var/run/docker.sock \
+#       -e CI_CONTAINER_RUNTIME=unix:///var/run/docker.sock \
+#       buildsystem-test
+#
+# Podman works the same way with its own socket path.
+
+FROM docker.io/library/rust:1.99-slim
+
+# The slim image leaves these out.
+RUN rustup component add rustfmt clippy
+
+WORKDIR /src
+COPY . .
+
+# Compile at image build time, so that running the image only runs tests.
+RUN cargo build --workspace --all-targets --locked --offline
+
+CMD ["sh", "-ec", "\
+    cargo fmt --all --check && \
+    cargo clippy --workspace --all-targets --locked --offline -- -D warnings && \
+    cargo test --workspace --locked --offline"]

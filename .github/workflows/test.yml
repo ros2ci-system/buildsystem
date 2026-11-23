@@ -1,0 +1,28 @@
+# This workflow only starts the tests. What the tests are is defined by
+# ci/Dockerfile.test, so they run the same way on any machine with a
+# container runtime and can move to another service unchanged.
+
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the test image
+        run: docker build -f ci/Dockerfile.test -t buildsystem-test .
+      - name: Run the tests, including those that need a container runtime
+        run: >
+          docker run --rm
+          -v /var/run/docker.sock:/var/run/docker.sock
+          -e CI_CONTAINER_RUNTIME=unix:///var/run/docker.sock
+          buildsystem-test

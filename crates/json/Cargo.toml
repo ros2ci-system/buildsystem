@@ -1,0 +1,10 @@
+[package]
+name = "ci_json"
+description = "JSON parser and serializer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "ci_container"
+description = "Client for the Docker and Podman HTTP API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ci_http = { path = "../http" }
+ci_json = { path = "../json" }
+
+[dev-dependencies]
+ci_tar = { path = "../tar" }
+
+[lints]
+workspace = true
