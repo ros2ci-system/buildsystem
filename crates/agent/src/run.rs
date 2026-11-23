@@ -22,11 +22,12 @@
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ci_container::{BuildEvent, BuildOptions, Client, ContainerSpec};
+use ci_container::{BuildEvent, BuildOptions, Client, ContainerSpec, ContainerState};
 use ci_crypto::{hex_encode, Sha256};
 use ci_json::Value;
 
@@ -395,37 +396,31 @@ fn run_in_container(
         }
     });
 
+    // The container is watched on another thread, because the runtime can
+    // take minutes to answer while it tears a container down, and this
+    // thread must keep calling the monitor through that. The watcher also
+    // does the killing, for the same reason.
+    let kill = AtomicBool::new(false);
     let mut timed_out = false;
     let mut stopped = false;
-    let state = loop {
-        let asked = Instant::now();
-        let state = client
-            .inspect_container(id)
-            .map_err(|e| format!("checking the container: {e}"))?;
-        if asked.elapsed() > SLOW_STEP {
-            eprintln!(
-                "note: the runtime took {:.1} s to report on container {id}",
-                asked.elapsed().as_secs_f64()
-            );
-        }
-        if !state.running {
-            break state;
-        }
-        if !timed_out && !stopped {
-            if monitor() == Control::Stop {
+    let state = thread::scope(|scope| {
+        let watcher = scope.spawn(|| watch_container(client, id, &kill));
+        while !watcher.is_finished() {
+            if timed_out || stopped {
+                let _ = monitor();
+            } else if monitor() == Control::Stop {
                 stopped = true;
-                client
-                    .kill_container(id)
-                    .map_err(|e| format!("killing the container on request: {e}"))?;
+                kill.store(true, Ordering::SeqCst);
             } else if Instant::now() >= deadline {
                 timed_out = true;
-                client
-                    .kill_container(id)
-                    .map_err(|e| format!("killing the container at its timeout: {e}"))?;
+                kill.store(true, Ordering::SeqCst);
             }
+            thread::sleep(POLL_INTERVAL);
         }
-        thread::sleep(POLL_INTERVAL);
-    };
+        watcher
+            .join()
+            .unwrap_or_else(|_| Err("watching the container panicked".to_string()))
+    })?;
     collected.image_id = state.image_id.clone();
 
     // Collecting the log and the outputs can take a while. It happens on
@@ -457,6 +452,34 @@ fn run_in_container(
         return Err("the container was killed for running out of memory".to_string());
     }
     Ok(Finished::Exited(state.exit_code))
+}
+
+/// Polls a container until it has stopped, and returns its final state.
+/// Kills it once `kill` is set.
+fn watch_container(client: &Client, id: &str, kill: &AtomicBool) -> Result<ContainerState, String> {
+    let mut killed = false;
+    loop {
+        let asked = Instant::now();
+        let state = client
+            .inspect_container(id)
+            .map_err(|e| format!("checking the container: {e}"))?;
+        if asked.elapsed() > SLOW_STEP {
+            eprintln!(
+                "note: the runtime took {:.1} s to report on container {id}",
+                asked.elapsed().as_secs_f64()
+            );
+        }
+        if !state.running {
+            return Ok(state);
+        }
+        if !killed && kill.load(Ordering::SeqCst) {
+            killed = true;
+            client
+                .kill_container(id)
+                .map_err(|e| format!("killing the container: {e}"))?;
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
 }
 
 /// How long to wait, after the container has stopped, for the runtime to
