@@ -217,6 +217,8 @@ impl System {
         Command::new(program("ci-admin"))
             .arg("--admin-url")
             .arg(format!("http://127.0.0.1:{}", self.admin_port))
+            .arg("--token-file")
+            .arg(self.dir.join("data/admin-token"))
             .args(args)
             .output()
             .unwrap()
@@ -795,4 +797,71 @@ fn a_restarted_agent_removes_the_container_it_left_behind() {
     system.admin_ok(&["cancel", &job]);
     assert_eq!(str_of(&system.wait_finished(&job), "outcome"), "cancelled");
     assert_no_job_directories(&system, agent);
+}
+
+#[test]
+fn the_admin_tool_needs_a_token() {
+    let Some(mut system) = System::start(false, &[]) else {
+        return;
+    };
+    let url = format!("http://127.0.0.1:{}", system.admin_port);
+    let run = |token_file: Option<&Path>, args: &[&str]| {
+        let mut command = Command::new(program("ci-admin"));
+        command
+            .env_remove("CI_ADMIN_TOKEN_FILE")
+            .arg("--admin-url")
+            .arg(&url);
+        if let Some(file) = token_file {
+            command.arg("--token-file").arg(file);
+        }
+        command.args(args).output().unwrap()
+    };
+
+    // No token file at all.
+    let output = run(None, &["status", "1"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("admin token"));
+
+    // A file holding something that is not a token.
+    let wrong = system.dir.join("wrong-token");
+    fs::write(&wrong, "not-a-token\n").unwrap();
+    let output = run(
+        Some(&wrong),
+        &["create-worker-token", "--name", "x", "--pool", "release"],
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("401"));
+    assert!(output.stdout.is_empty(), "no token may be printed");
+
+    // A second administrator gets a token of their own, which works, and
+    // which the first can take away again.
+    let second = system.dir.join("second-token");
+    fs::write(
+        &second,
+        system.admin_ok(&["create-admin-token", "--name", "second administrator"]),
+    )
+    .unwrap();
+    assert!(run(
+        Some(&second),
+        &["create-worker-token", "--name", "x", "--pool", "release"]
+    )
+    .status
+    .success());
+    system.admin_ok(&["revoke-admin-token", "2"]);
+    assert!(!run(Some(&second), &["status", "1"]).status.success());
+
+    // The coordinator's log says which administrator did what.
+    system.start_agent("release");
+    let job = system.submit("release", "echo audited", 120, &[]);
+    system.wait_finished(&job);
+    let log = fs::read_to_string(system.dir.join("coordinator.log")).unwrap();
+    assert!(
+        log.contains("first admin token, created at start-up"),
+        "{log}"
+    );
+    assert!(log.contains(&format!("submitted job {job}")), "{log}");
+    assert!(
+        log.contains("admin \"second administrator\": created worker token"),
+        "{log}"
+    );
 }

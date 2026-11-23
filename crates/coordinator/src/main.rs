@@ -28,11 +28,13 @@ The database is named by the CI_DATABASE_URL environment variable, as
 postgres://user:password@host:port/database. It is not a command-line
 option, so that the password does not show in the process list.
 
-  --data-dir <dir>           Where logs and artifacts are stored.
+  --data-dir <dir>           Where logs and artifacts are stored. On first
+                             start, the first admin token is written here as
+                             the file admin-token.
   --worker-listen <addr>     Address for the worker API. Default 0.0.0.0:8443.
   --admin-listen <addr>      Address for the admin API. Default 127.0.0.1:8444.
-                             The admin API has no authentication: keep this
-                             address private.
+                             Every call needs an admin token. Keep this
+                             address private all the same.
   --tls-cert <file>          Certificate chain for the worker API, in PEM.
   --tls-key <file>           Its private key, in PEM. Without these two the
                              worker API is plain HTTP, for local use only.
@@ -153,6 +155,21 @@ fn run(args: &[String]) -> Result<(), String> {
         },
     });
 
+    // With no admin token, nobody could use the admin API to create one.
+    // The first is written to a file that only this user can read.
+    if let Some(token) = coordinator
+        .bootstrap_admin_token()
+        .map_err(|e| e.to_string())?
+    {
+        let path = options.data_dir.join("admin-token");
+        write_private_file(&path, &token)
+            .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        eprintln!(
+            "created the first admin token and wrote it to {}",
+            path.display()
+        );
+    }
+
     // Time spent down must not count against workers that could not
     // reach the coordinator.
     let extended = coordinator
@@ -214,4 +231,26 @@ fn run(args: &[String]) -> Result<(), String> {
         move |request| coordinator.handle_worker(request),
     );
     Err(format!("the worker API stopped: {error}"))
+}
+
+/// Writes a file that only the current user can read. On Unix the
+/// permissions are set when the file is created, so there is no moment at
+/// which others could read it. On Windows the file takes the permissions
+/// of its directory, so the data directory itself must be private.
+fn write_private_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    // A leftover file from an earlier database is replaced, never
+    // appended to or reused.
+    let _ = std::fs::remove_file(path);
+    let mut file = options.open(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.write_all(b"\n")?;
+    file.sync_all()
 }

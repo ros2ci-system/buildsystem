@@ -133,8 +133,38 @@ impl Coordinator {
         self.wait_until_listening();
     }
 
-    /// Sends a request and returns the status and the reply's bytes.
+    /// The first admin token, which the coordinator wrote to its data
+    /// directory when it started.
+    fn admin_token(&self) -> String {
+        fs::read_to_string(self.data_dir.join("admin-token"))
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    /// Sends a request and returns the status and the reply's bytes. A
+    /// call to the admin API with no token given uses the admin token.
     fn call(
+        &self,
+        base: &str,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: Option<&[u8]>,
+    ) -> (u16, Vec<u8>) {
+        let admin_token;
+        let token = match token {
+            None if base == self.admin_url => {
+                admin_token = self.admin_token();
+                Some(admin_token.as_str())
+            }
+            other => other,
+        };
+        self.raw(base, method, path, token, body)
+    }
+
+    /// Sends a request with exactly the token given, or none.
+    fn raw(
         &self,
         base: &str,
         method: &str,
@@ -540,18 +570,20 @@ fn calls_without_a_valid_token_are_refused() {
             404
         );
     }
-    // And the worker API is not on the admin listener.
-    assert_eq!(
-        c.json(
+    // And the worker API is not on the admin listener: a worker's token
+    // is not an admin token, and with an admin token the path is unknown.
+    let claim = |token: &str| {
+        c.raw(
             &c.admin_url,
             "POST",
             "/worker/v1/claim",
-            Some(&session),
-            empty()
+            Some(token),
+            Some(b"{}"),
         )
-        .0,
-        404
-    );
+        .0
+    };
+    assert_eq!(claim(&session), 401);
+    assert_eq!(claim(&c.admin_token()), 404);
 }
 
 #[test]
@@ -1085,4 +1117,277 @@ fn a_restart_loses_nothing() {
     assert_eq!(c.claim(&session), Some((queued, 1)));
     c.restart();
     assert_eq!(str_of(&c.status(queued), "state"), "running");
+}
+
+#[test]
+fn the_admin_api_needs_an_admin_token() {
+    let Some(mut c) = Coordinator::start(&[]) else {
+        return;
+    };
+    let session = c.register("release", "linux", "amd64");
+    let job_id = c.submit("release", "linux", "amd64");
+    let job = c.claim(&session).unwrap();
+    assert_eq!(
+        c.report(&session, job, 0, b"secret build output\n").0,
+        "continue"
+    );
+
+    // Every admin path, with no token, a made-up token, a worker's session
+    // token, and a token in the wrong scheme.
+    let first = c.admin_token();
+    let basic = format!("Basic {first}");
+    let paths = [
+        ("POST", "/admin/v1/jobs".to_string()),
+        ("GET", format!("/admin/v1/jobs/{job_id}")),
+        ("GET", format!("/admin/v1/jobs/{job_id}/log")),
+        ("GET", format!("/admin/v1/jobs/{job_id}/artifacts/x")),
+        ("POST", format!("/admin/v1/jobs/{job_id}/cancel")),
+        ("POST", "/admin/v1/worker-tokens".to_string()),
+        ("POST", "/admin/v1/worker-tokens/1/revoke".to_string()),
+        ("POST", "/admin/v1/admin-tokens".to_string()),
+        ("POST", "/admin/v1/admin-tokens/1/revoke".to_string()),
+        ("GET", "/admin/v1/no-such-path".to_string()),
+        ("GET", "/".to_string()),
+    ];
+    for (method, path) in &paths {
+        for token in [None, Some("not-a-token"), Some(session.as_str()), Some("")] {
+            let (status, body) = c.raw(&c.admin_url, method, path, token, Some(b"{}"));
+            assert_eq!(status, 401, "{method} {path} with token {token:?}");
+            assert!(
+                !String::from_utf8_lossy(&body).contains("secret"),
+                "{method} {path}"
+            );
+        }
+        // "Basic" in place of "Bearer" is not accepted either.
+        let url = Url::parse(&format!("{}{path}", c.admin_url)).unwrap();
+        let host = url.host_header();
+        let response = Connector::plain_only()
+            .send(
+                &url,
+                Request::new(method, &url.target, &host).header("Authorization", &basic),
+            )
+            .unwrap();
+        assert_eq!(response.status, 401, "{method} {path} with Basic");
+    }
+    // Nothing above had any effect.
+    let status = c.status(job_id);
+    assert_eq!(str_of(&status, "state"), "running");
+    assert_eq!(
+        status.get("cancel_requested").unwrap().as_bool(),
+        Some(false)
+    );
+
+    // With the admin token, an unknown path is simply not found.
+    assert_eq!(
+        c.call(&c.admin_url, "GET", "/admin/v1/no-such-path", None, None)
+            .0,
+        404
+    );
+
+    // The token is stored only as a hash.
+    let mut database =
+        ci_postgres::Connection::connect(&ci_postgres::Config::parse(&c.database_url).unwrap())
+            .unwrap();
+    let stored = database
+        .query("SELECT token_hash FROM admin_tokens", &[])
+        .unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(
+        stored.first().unwrap().text(0).unwrap(),
+        hex_encode(&sha256(first.as_bytes()))
+    );
+    drop(database);
+
+    // The token file can be read only by its owner.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(c.data_dir.join("admin-token"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    // A restart keeps the token: no second one is created.
+    c.restart();
+    assert_eq!(c.admin_token(), first);
+    assert_eq!(str_of(&c.status(job_id), "state"), "running");
+}
+
+#[test]
+fn admin_tokens_can_be_issued_and_revoked() {
+    let Some(mut c) = Coordinator::start(&[]) else {
+        return;
+    };
+    let first = c.admin_token();
+    let with = |token: &str, method: &str, path: &str, body: Option<Value>| {
+        let text = body.map(|b| b.to_json());
+        let (status, bytes) = c.raw(
+            &c.admin_url,
+            method,
+            path,
+            Some(token),
+            text.as_deref().map(str::as_bytes),
+        );
+        (status, ci_json::parse_bytes(&bytes).unwrap())
+    };
+    let name = |text: &str| Some(Value::object([("name", Value::from(text))]));
+
+    let (status, reply) = with(
+        &first,
+        "POST",
+        "/admin/v1/admin-tokens",
+        name("second administrator"),
+    );
+    assert_eq!(status, 201, "{reply:?}");
+    let second = str_of(&reply, "token").to_string();
+    let second_id = reply.get("token_id").unwrap().as_i64().unwrap();
+    assert_ne!(second, first);
+    assert_eq!(
+        with(&first, "POST", "/admin/v1/admin-tokens", name("")).0,
+        400
+    );
+    assert_eq!(with(&first, "POST", "/admin/v1/admin-tokens", None).0, 400);
+
+    // The new token works, and can revoke the first.
+    let job_id = {
+        let (status, reply) = with(
+            &second,
+            "POST",
+            "/admin/v1/jobs",
+            Some(job_request("release", "linux", "amd64")),
+        );
+        assert_eq!(status, 201, "{reply:?}");
+        reply.get("job_id").unwrap().as_i64().unwrap()
+    };
+    assert_eq!(
+        with(&second, "POST", "/admin/v1/admin-tokens/1/revoke", None).0,
+        200
+    );
+    assert_eq!(
+        with(&first, "GET", &format!("/admin/v1/jobs/{job_id}"), None).0,
+        401
+    );
+    assert_eq!(
+        with(&second, "GET", &format!("/admin/v1/jobs/{job_id}"), None).0,
+        200
+    );
+    // Revoking twice, or revoking a token that never existed, is reported.
+    assert_eq!(
+        with(&second, "POST", "/admin/v1/admin-tokens/1/revoke", None).0,
+        404
+    );
+    assert_eq!(
+        with(&second, "POST", "/admin/v1/admin-tokens/999/revoke", None).0,
+        404
+    );
+    assert_eq!(
+        with(&second, "POST", "/admin/v1/admin-tokens/x/revoke", None).0,
+        404
+    );
+
+    // A revoked token stays revoked across a restart, and no new first
+    // token appears while another token still works.
+    let (worker_port, admin_port) = (c.worker_port, c.admin_port);
+    c.restart();
+    assert_eq!((c.worker_port, c.admin_port), (worker_port, admin_port));
+    assert_eq!(
+        c.raw(
+            &c.admin_url,
+            "GET",
+            &format!("/admin/v1/jobs/{job_id}"),
+            Some(&first),
+            None
+        )
+        .0,
+        401
+    );
+    assert_eq!(
+        c.raw(
+            &c.admin_url,
+            "GET",
+            &format!("/admin/v1/jobs/{job_id}"),
+            Some(&second),
+            None
+        )
+        .0,
+        200
+    );
+    assert_eq!(c.admin_token(), first, "the token file was not rewritten");
+
+    // If every token is revoked, the next start makes a new first token,
+    // so an administrator who can read the data directory can get back in.
+    let revoke = format!("/admin/v1/admin-tokens/{second_id}/revoke");
+    assert_eq!(
+        c.raw(&c.admin_url, "POST", &revoke, Some(&second), None).0,
+        200
+    );
+    assert_eq!(
+        c.raw(
+            &c.admin_url,
+            "GET",
+            &format!("/admin/v1/jobs/{job_id}"),
+            Some(&second),
+            None
+        )
+        .0,
+        401
+    );
+    c.restart();
+    let third = c.admin_token();
+    assert_ne!(third, first);
+    assert_ne!(third, second);
+    assert_eq!(
+        c.raw(
+            &c.admin_url,
+            "GET",
+            &format!("/admin/v1/jobs/{job_id}"),
+            Some(&third),
+            None
+        )
+        .0,
+        200
+    );
+}
+
+#[test]
+fn a_revoked_worker_token_shuts_its_workers_out() {
+    let Some(c) = Coordinator::start(&[]) else {
+        return;
+    };
+    let session = c.register("release", "linux", "amd64");
+    let other = c.register("release", "linux", "amd64");
+    let job_id = c.submit("release", "linux", "amd64");
+    let job = c.claim(&session).unwrap();
+
+    // The first registration used worker token 1.
+    assert_eq!(
+        c.admin("POST", "/admin/v1/worker-tokens/1/revoke", None).0,
+        200
+    );
+    let empty = || Some(Value::object::<&str>([]));
+    assert_eq!(
+        c.json(
+            &c.worker_url,
+            "POST",
+            "/worker/v1/claim",
+            Some(&session),
+            empty()
+        )
+        .0,
+        401
+    );
+    let upload = format!("/worker/v1/jobs/{job_id}/attempts/{}/artifacts/x", job.1);
+    assert_eq!(
+        c.call(&c.worker_url, "PUT", &upload, Some(&session), Some(b"x"))
+            .0,
+        401
+    );
+    // A worker enrolled with a different token is unaffected.
+    assert_eq!(c.claim(&other), None);
+    assert_eq!(
+        c.admin("POST", "/admin/v1/worker-tokens/1/revoke", None).0,
+        404
+    );
 }

@@ -71,6 +71,14 @@ const MIGRATIONS: &[&str] = &[
         sha256 text NOT NULL,
         PRIMARY KEY (job_id, attempt, path)
     );",
+    // 2: tokens for the admin API.
+    "CREATE TABLE admin_tokens (
+        id bigserial PRIMARY KEY,
+        name text NOT NULL,
+        token_hash text NOT NULL UNIQUE,
+        revoked boolean NOT NULL DEFAULT false,
+        created_at timestamptz NOT NULL DEFAULT now()
+    );",
 ];
 
 const TIMESTAMP: &str = "'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'";
@@ -193,6 +201,71 @@ impl Db {
         }
         let connection = guard.as_mut().expect("the connection was just set");
         body(connection)
+    }
+
+    pub fn create_admin_token(&self, name: &str, token_hash: &str) -> Result<i64, Error> {
+        self.with(|c| {
+            c.query(
+                "INSERT INTO admin_tokens (name, token_hash) VALUES ($1, $2) RETURNING id",
+                &[name.into(), token_hash.into()],
+            )?
+            .first()
+            .ok_or_else(no_row)?
+            .int(0)
+        })
+    }
+
+    /// Creates the first admin token, if there is no usable one. Returns
+    /// whether it did. The check and the insert are one statement, so two
+    /// callers cannot both create a first token.
+    pub fn create_first_admin_token(&self, name: &str, token_hash: &str) -> Result<bool, Error> {
+        self.with(|c| {
+            let created = c.execute(
+                "INSERT INTO admin_tokens (name, token_hash)
+                 SELECT $1, $2 WHERE NOT EXISTS (SELECT 1 FROM admin_tokens WHERE NOT revoked)",
+                &[name.into(), token_hash.into()],
+            )?;
+            Ok(created > 0)
+        })
+    }
+
+    /// The id and name of the admin token with this hash, unless it has
+    /// been revoked.
+    pub fn authenticate_admin(&self, token_hash: &str) -> Result<Option<(i64, String)>, Error> {
+        self.with(|c| {
+            let rows = c.query(
+                "SELECT id, name FROM admin_tokens WHERE token_hash = $1 AND NOT revoked",
+                &[token_hash.into()],
+            )?;
+            rows.first()
+                .map(|row| Ok((row.int(0)?, row.text(1)?.to_string())))
+                .transpose()
+        })
+    }
+
+    /// Revokes an admin token. Returns `false` when there is no such
+    /// token or it was already revoked.
+    pub fn revoke_admin_token(&self, id: i64) -> Result<bool, Error> {
+        self.with(|c| {
+            let changed = c.execute(
+                "UPDATE admin_tokens SET revoked = true WHERE id = $1 AND NOT revoked",
+                &[id.into()],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
+    /// Revokes a worker enrolment token. Workers that registered with it
+    /// are refused from then on. Returns `false` when there is no such
+    /// token or it was already revoked.
+    pub fn revoke_worker_token(&self, id: i64) -> Result<bool, Error> {
+        self.with(|c| {
+            let changed = c.execute(
+                "UPDATE worker_tokens SET revoked = true WHERE id = $1 AND NOT revoked",
+                &[id.into()],
+            )?;
+            Ok(changed > 0)
+        })
     }
 
     pub fn create_worker_token(

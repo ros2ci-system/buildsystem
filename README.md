@@ -37,10 +37,14 @@ The system is a PostgreSQL database, one coordinator and any number of agents.
 Each agent needs a container runtime (Docker or Podman) on its machine.
 
 ```
-# The coordinator. The admin API has no authentication: keep it on localhost.
+# The coordinator. On its first start it writes the first admin token to
+# the file admin-token in the data directory, readable only by its user.
 export CI_DATABASE_URL=postgres://user:password@localhost/ros2ci
 ci-coordinator --data-dir /var/lib/ros2ci \
     --tls-cert server.pem --tls-key server.key
+
+# The admin tool needs an admin token.
+export CI_ADMIN_TOKEN_FILE=/var/lib/ros2ci/admin-token
 
 # A token for a worker. The pool is fixed by the token.
 ci-admin create-worker-token --name "builder 1" --pool release > token
@@ -55,6 +59,14 @@ ci-admin submit --pool release --os linux --arch amd64 --job job.json --wait
 
 Without `--tls-cert` and `--tls-key` the worker API is plain HTTP, which is
 only for running everything on one machine.
+
+Every call to the admin API needs an admin token, and the coordinator's log
+names the token behind each action. `ci-admin create-admin-token` issues more,
+so each person or service can have its own, and `ci-admin revoke-admin-token`
+takes one away. The admin API also listens on its own address, `127.0.0.1` by
+default; keep it private as a second line of defence. If every admin token is
+lost or revoked, revoke them all in the database and restart the coordinator:
+it writes a new first token when no usable one exists.
 
 How it behaves:
 

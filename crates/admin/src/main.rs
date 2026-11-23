@@ -15,12 +15,20 @@ use ci_json::Value;
 use ci_net::{Connector, Url};
 
 const USAGE: &str = "\
-Usage: ci-admin [--admin-url <url>] <command>
+Usage: ci-admin [--admin-url <url>] [--token-file <file>] <command>
 
 Commands:
   create-worker-token --name <text> --pool <pool>
       Issues an enrolment token for a worker and prints it. The token is
       shown once and cannot be recovered.
+  revoke-worker-token <token-id>
+      Revokes a worker's enrolment token. Workers that registered with it
+      are refused from then on.
+  create-admin-token --name <text>
+      Issues another admin token and prints it. Give each person or
+      service its own, so that the coordinator's log says who did what.
+  revoke-admin-token <token-id>
+      Revokes an admin token.
   submit --pool <pool> --os <os> --arch <arch> --job <file> [--wait]
       Queues a job from a job description file and prints its id. With
       --wait, follows the job's log until it finishes; the exit status is
@@ -35,13 +43,19 @@ Commands:
   cancel <job-id>
       Cancels a job.
 
-  --admin-url <url>   The coordinator's admin API. Defaults to the
-                      CI_ADMIN_URL environment variable, then to
-                      http://127.0.0.1:8444.
+  --admin-url <url>    The coordinator's admin API. Defaults to the
+                       CI_ADMIN_URL environment variable, then to
+                       http://127.0.0.1:8444.
+  --token-file <file>  A file holding an admin token. Defaults to the
+                       CI_ADMIN_TOKEN_FILE environment variable. The
+                       coordinator writes the first token to the file
+                       admin-token in its data directory.
 ";
 
 struct Admin {
     base: Url,
+    /// The `Authorization` header value.
+    authorization: String,
 }
 
 impl Admin {
@@ -53,7 +67,8 @@ impl Admin {
     ) -> Result<(u16, ci_http::Response<ci_net::Stream>), String> {
         let url = self.base.with_target(path);
         let host = url.host_header();
-        let mut request = Request::new(method, &url.target, &host);
+        let mut request =
+            Request::new(method, &url.target, &host).header("Authorization", &self.authorization);
         if let Some(body) = body {
             request = request
                 .header("Content-Type", "application/json")
@@ -154,12 +169,17 @@ fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut admin_url =
         std::env::var("CI_ADMIN_URL").unwrap_or_else(|_| "http://127.0.0.1:8444".to_string());
-    if args.first().map(String::as_str) == Some("--admin-url") {
+    let mut token_file = std::env::var("CI_ADMIN_TOKEN_FILE").ok();
+    while let Some(name @ ("--admin-url" | "--token-file")) = args.first().map(String::as_str) {
         if args.len() < 2 {
-            eprintln!("ci-admin: --admin-url needs a value");
+            eprintln!("ci-admin: {name} needs a value");
             return ExitCode::from(64);
         }
-        admin_url = args[1].clone();
+        if name == "--admin-url" {
+            admin_url = args[1].clone();
+        } else {
+            token_file = Some(args[1].clone());
+        }
         args.drain(..2);
     }
     let Some(command) = args.first().cloned() else {
@@ -179,7 +199,20 @@ fn main() -> ExitCode {
                         .to_string(),
                 );
             }
-            run(&Admin { base }, &command, &args[1..])
+            let token_file = token_file
+                .ok_or("an admin token is needed: use --token-file or set CI_ADMIN_TOKEN_FILE")?;
+            let token = fs::read_to_string(&token_file)
+                .map_err(|e| format!("cannot read {token_file}: {e}"))?
+                .trim()
+                .to_string();
+            if token.is_empty() || token.bytes().any(|b| b.is_ascii_control()) {
+                return Err(format!("{token_file} does not hold a token"));
+            }
+            let admin = Admin {
+                base,
+                authorization: format!("Bearer {token}"),
+            };
+            run(&admin, &command, &args[1..])
         });
     match result {
         Ok(code) => code,
@@ -213,6 +246,52 @@ fn run(admin: &Admin, command: &str, args: &[String]) -> Result<ExitCode, String
                     .and_then(Value::as_str)
                     .ok_or("the reply has no token")?
             );
+            Ok(ExitCode::SUCCESS)
+        }
+        "create-admin-token" => {
+            let (options, positional) = parse_args(args, &[])?;
+            only_options(&options, &["name"])?;
+            if !positional.is_empty() {
+                return Err(format!("unexpected argument {:?}", positional[0]));
+            }
+            let reply = admin.json(
+                "POST",
+                "/admin/v1/admin-tokens",
+                Some(&Value::object([(
+                    "name",
+                    Value::from(option(&options, "name")?),
+                )])),
+            )?;
+            // The id, for revoking the token later, goes to standard error
+            // so that standard output holds only the token.
+            eprintln!(
+                "token id {}",
+                reply.get("token_id").and_then(Value::as_i64).unwrap_or(0)
+            );
+            println!(
+                "{}",
+                reply
+                    .get("token")
+                    .and_then(Value::as_str)
+                    .ok_or("the reply has no token")?
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        "revoke-admin-token" | "revoke-worker-token" => {
+            let (options, positional) = parse_args(args, &[])?;
+            only_options(&options, &[])?;
+            let id = positional
+                .first()
+                .and_then(|text| text.parse::<i64>().ok())
+                .filter(|id| *id > 0)
+                .ok_or("a token id is required")?;
+            let kind = if command == "revoke-admin-token" {
+                "admin-tokens"
+            } else {
+                "worker-tokens"
+            };
+            admin.json("POST", &format!("/admin/v1/{kind}/{id}/revoke"), None)?;
+            eprintln!("token {id} revoked");
             Ok(ExitCode::SUCCESS)
         }
         "submit" => {

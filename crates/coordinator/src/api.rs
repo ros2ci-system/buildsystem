@@ -7,9 +7,9 @@
 //! Finish and artifact upload. Every call but Register needs the session
 //! token that Register returned.
 //!
-//! The **admin API** submits and inspects jobs and issues worker tokens.
-//! It has no authentication of its own, so it listens on a separate
-//! address that must stay private.
+//! The **admin API** submits and inspects jobs and issues tokens. Every
+//! call needs an admin token. It listens on its own address, which should
+//! stay private as a second line of defence.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -465,14 +465,45 @@ impl Coordinator {
     }
 
     fn route_admin(&self, request: &mut Request<'_>) -> Result<Response, Reject> {
+        // Checked before anything else, so that an unauthenticated caller
+        // learns nothing, not even which paths exist.
+        let token = request
+            .bearer_token()
+            .ok_or_else(|| reject(401, "an admin token is required"))?;
+        let (_, admin) = self
+            .db
+            .authenticate_admin(&token_hash(token))?
+            .ok_or_else(|| reject(401, "unknown admin token"))?;
+
         let path = request.path.clone();
         let segments = path_segments(&path);
         let job = |text: &str| text.parse::<i64>().map_err(|_| reject(404, "no such job"));
+        let token_id = |text: &str| {
+            text.parse::<i64>()
+                .map_err(|_| reject(404, "no such token"))
+        };
         match (request.method.as_str(), segments.as_slice()) {
-            ("POST", ["admin", "v1", "worker-tokens"]) => self.create_worker_token(request),
-            ("POST", ["admin", "v1", "jobs"]) => self.submit_job(request),
+            ("POST", ["admin", "v1", "admin-tokens"]) => self.create_admin_token(&admin, request),
+            ("POST", ["admin", "v1", "admin-tokens", id, "revoke"]) => {
+                let id = token_id(id)?;
+                if !self.db.revoke_admin_token(id)? {
+                    return Err(reject(404, "no such token"));
+                }
+                eprintln!("admin {admin:?}: revoked admin token {id}");
+                Ok(json_ok(Value::object([("revoked", Value::Bool(true))])))
+            }
+            ("POST", ["admin", "v1", "worker-tokens"]) => self.create_worker_token(&admin, request),
+            ("POST", ["admin", "v1", "worker-tokens", id, "revoke"]) => {
+                let id = token_id(id)?;
+                if !self.db.revoke_worker_token(id)? {
+                    return Err(reject(404, "no such token"));
+                }
+                eprintln!("admin {admin:?}: revoked worker token {id}");
+                Ok(json_ok(Value::object([("revoked", Value::Bool(true))])))
+            }
+            ("POST", ["admin", "v1", "jobs"]) => self.submit_job(&admin, request),
             ("GET", ["admin", "v1", "jobs", id]) => self.job_status(job(id)?),
-            ("POST", ["admin", "v1", "jobs", id, "cancel"]) => self.cancel_job(job(id)?),
+            ("POST", ["admin", "v1", "jobs", id, "cancel"]) => self.cancel_job(&admin, job(id)?),
             ("GET", ["admin", "v1", "jobs", id, "log"]) => self.job_log(job(id)?),
             ("GET", ["admin", "v1", "jobs", id, "artifacts", rest @ ..]) if !rest.is_empty() => {
                 self.job_artifact(job(id)?, &rest.join("/"))
@@ -481,7 +512,46 @@ impl Coordinator {
         }
     }
 
-    fn create_worker_token(&self, request: &mut Request<'_>) -> Result<Response, Reject> {
+    /// Creates the first admin token if there is none, and returns it.
+    /// The caller writes it somewhere only an administrator can read.
+    pub fn bootstrap_admin_token(&self) -> Result<Option<String>, DbError> {
+        let token = random_token(32);
+        let created = self.db.create_first_admin_token(
+            "first admin token, created at start-up",
+            &token_hash(&token),
+        )?;
+        Ok(created.then_some(token))
+    }
+
+    fn create_admin_token(
+        &self,
+        admin: &str,
+        request: &mut Request<'_>,
+    ) -> Result<Response, Reject> {
+        let body = read_json(request)?;
+        let name = str_field(&body, "name")?;
+        if name.is_empty() || name.len() > 200 || name.chars().any(char::is_control) {
+            return Err(reject(400, "\"name\" must be a short description"));
+        }
+        let token = random_token(32);
+        let id = self.db.create_admin_token(name, &token_hash(&token))?;
+        eprintln!("admin {admin:?}: created admin token {id}: {name}");
+        Ok(Response::json(
+            201,
+            Value::object([
+                ("token_id", Value::Int(id)),
+                // Shown once. Only its hash is kept.
+                ("token", Value::from(token)),
+            ])
+            .to_json(),
+        ))
+    }
+
+    fn create_worker_token(
+        &self,
+        admin: &str,
+        request: &mut Request<'_>,
+    ) -> Result<Response, Reject> {
         let body = read_json(request)?;
         let name = str_field(&body, "name")?;
         let pool = str_field(&body, "pool")?;
@@ -495,7 +565,7 @@ impl Coordinator {
         let id = self
             .db
             .create_worker_token(name, pool, &token_hash(&token))?;
-        eprintln!("worker token {id} created for pool {pool}: {name}");
+        eprintln!("admin {admin:?}: created worker token {id} for pool {pool}: {name}");
         Ok(Response::json(
             201,
             Value::object([
@@ -507,7 +577,7 @@ impl Coordinator {
         ))
     }
 
-    fn submit_job(&self, request: &mut Request<'_>) -> Result<Response, Reject> {
+    fn submit_job(&self, admin: &str, request: &mut Request<'_>) -> Result<Response, Reject> {
         let body = read_json(request)?;
         let pool = str_field(&body, "pool")?;
         let os = str_field(&body, "os")?;
@@ -533,7 +603,7 @@ impl Coordinator {
             ));
         }
         let id = self.db.submit_job(pool, os, arch, &description)?;
-        eprintln!("job {id} submitted: pool {pool}, {os}/{arch}");
+        eprintln!("admin {admin:?}: submitted job {id}: pool {pool}, {os}/{arch}");
         Ok(Response::json(
             201,
             Value::object([("job_id", Value::Int(id))]).to_json(),
@@ -587,11 +657,11 @@ impl Coordinator {
         ])))
     }
 
-    fn cancel_job(&self, job_id: i64) -> Result<Response, Reject> {
+    fn cancel_job(&self, admin: &str, job_id: i64) -> Result<Response, Reject> {
         if !self.db.cancel_job(job_id)? {
             return Err(reject(404, "no such job"));
         }
-        eprintln!("job {job_id}: cancellation requested");
+        eprintln!("admin {admin:?}: requested cancellation of job {job_id}");
         self.job_status(job_id)
     }
 
