@@ -198,6 +198,131 @@ pub struct ContainerSpec {
     pub labels: Vec<(String, String)>,
 }
 
+/// How to build an image.
+#[derive(Debug, Clone, Default)]
+pub struct BuildOptions {
+    /// The name the built image is stored under.
+    pub tag: String,
+    /// The build file's path inside the context, with `/` separators.
+    pub build_file: String,
+    /// Windows only: `process` or `hyperv`, for the containers the build
+    /// itself runs.
+    pub isolation: Option<String>,
+    pub labels: Vec<(String, String)>,
+}
+
+/// One thing a running build reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildEvent {
+    /// Text for the build's log.
+    Output(String),
+    /// The build failed, and why. Nothing follows it.
+    Failed(String),
+}
+
+/// The progress of a running image build.
+pub struct BuildStream {
+    lines: LineReader<Response<Connection>>,
+}
+
+impl BuildStream {
+    /// The next thing the build reported, or `None` when it has ended.
+    /// A build that ends without a `Failed` event succeeded.
+    pub fn next_event(&mut self) -> Result<Option<BuildEvent>, Error> {
+        loop {
+            let Some(line) = self.lines.next_line()? else {
+                return Ok(None);
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Some(event) = parse_build_event(&line)? {
+                return Ok(Some(event));
+            }
+        }
+    }
+}
+
+/// The runtime reports a build as JSON objects, one per line. Text for
+/// the log is in "stream", and a failure is in "error". Other members,
+/// such as progress bars for pulled layers, carry nothing worth keeping.
+fn parse_build_event(line: &str) -> Result<Option<BuildEvent>, Error> {
+    let Ok(event) = ci_json::parse(line) else {
+        return Err(Error::UnexpectedReply(format!(
+            "build progress was not JSON: {line}"
+        )));
+    };
+    if let Some(error) = event.get("error").and_then(Value::as_str) {
+        return Ok(Some(BuildEvent::Failed(error.to_string())));
+    }
+    if let Some(detail) = event.get("errorDetail") {
+        let message = detail
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("the build failed");
+        return Ok(Some(BuildEvent::Failed(message.to_string())));
+    }
+    if let Some(text) = event.get("stream").and_then(Value::as_str) {
+        return Ok(Some(BuildEvent::Output(text.to_string())));
+    }
+    if let Some(status) = event.get("status").and_then(Value::as_str) {
+        // Layer pulls report many progress updates under the same
+        // status. Only the ones without a progress bar are log lines.
+        if event
+            .get("progressDetail")
+            .and_then(Value::as_object)
+            .is_none_or(<[_]>::is_empty)
+        {
+            let id = event.get("id").and_then(Value::as_str).unwrap_or("");
+            let text = if id.is_empty() {
+                format!("{status}\n")
+            } else {
+                format!("{id}: {status}\n")
+            };
+            return Ok(Some(BuildEvent::Output(text)));
+        }
+    }
+    Ok(None)
+}
+
+/// Stops a running build by closing its connection, which the runtimes
+/// take as a request to abandon it.
+pub struct BuildCanceller {
+    #[cfg(unix)]
+    socket: Option<std::os::unix::net::UnixStream>,
+}
+
+impl BuildCanceller {
+    fn new(connection: &Connection) -> BuildCanceller {
+        match connection {
+            #[cfg(unix)]
+            Connection::Unix(socket) => BuildCanceller {
+                socket: socket.try_clone().ok(),
+            },
+            #[cfg(windows)]
+            Connection::Pipe(_) => BuildCanceller {},
+        }
+    }
+
+    /// Asks for the build to stop. Returns whether the request could be
+    /// made. On Windows it cannot: a read blocked on a named pipe can
+    /// only be interrupted through an API the standard library does not
+    /// offer, so the build runs on until it ends by itself.
+    pub fn cancel(&self) -> bool {
+        #[cfg(unix)]
+        {
+            match &self.socket {
+                Some(socket) => socket.shutdown(std::net::Shutdown::Both).is_ok(),
+                None => false,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+}
+
 /// The state of a container, from an inspect call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerState {
@@ -243,6 +368,110 @@ impl Client {
             }
             _ => Err(api_error(&mut response)),
         }
+    }
+
+    /// The id of an image in the runtime's local store, or `None` if it
+    /// is not there.
+    pub fn image_id(&self, image: &str) -> Result<Option<String>, Error> {
+        check_reference(image)?;
+        let target = format!("{API_PREFIX}/images/{image}/json");
+        let mut response = self.request("GET", &target, &[], Body::Empty)?;
+        match response.status {
+            200 => {
+                let bytes = response.body_bytes(MAX_JSON_BODY)?;
+                let value = ci_json::parse_bytes(&bytes)
+                    .map_err(|e| Error::UnexpectedReply(e.to_string()))?;
+                match value.get("Id").and_then(Value::as_str) {
+                    Some(id) if !id.is_empty() => Ok(Some(id.to_string())),
+                    _ => Err(Error::UnexpectedReply(
+                        "image inspect returned no id".to_string(),
+                    )),
+                }
+            }
+            404 => {
+                drain(&mut response);
+                Ok(None)
+            }
+            _ => Err(api_error(&mut response)),
+        }
+    }
+
+    /// Removes an image from the local store. An image that is not there
+    /// is not an error.
+    pub fn remove_image(&self, image: &str) -> Result<(), Error> {
+        check_reference(image)?;
+        let target = format!("{API_PREFIX}/images/{image}?force=true");
+        let mut response = self.request("DELETE", &target, &[], Body::Empty)?;
+        if !response.is_success() && response.status != 404 {
+            return Err(api_error(&mut response));
+        }
+        drain(&mut response);
+        Ok(())
+    }
+
+    /// Starts building an image from a build context, which is a tar
+    /// archive holding the build file and whatever it copies in. The
+    /// build's progress is read from the returned stream, and the build
+    /// has finished when the stream ends.
+    ///
+    /// The second value stops the build from another thread.
+    pub fn build_image(
+        &self,
+        options: &BuildOptions,
+        context: &mut dyn Read,
+    ) -> Result<(BuildStream, BuildCanceller), Error> {
+        check_reference(&options.tag)?;
+        if options.build_file.is_empty()
+            || options.build_file.starts_with('/')
+            || options
+                .build_file
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+            || options.build_file.contains(['\\', '\0'])
+        {
+            return Err(Error::InvalidArgument(format!(
+                "bad build file path {:?}",
+                options.build_file
+            )));
+        }
+        let mut target = format!(
+            "{API_PREFIX}/build?t={}&dockerfile={}&rm=1&forcerm=1",
+            percent_encode(&options.tag),
+            percent_encode(&options.build_file)
+        );
+        if let Some(isolation) = &options.isolation {
+            target.push_str("&isolation=");
+            target.push_str(&percent_encode(isolation));
+        }
+        if !options.labels.is_empty() {
+            for (name, value) in &options.labels {
+                check_label(name)?;
+                check_label(value)?;
+            }
+            let labels = Value::object(
+                options
+                    .labels
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), Value::from(value.as_str()))),
+            );
+            target.push_str("&labels=");
+            target.push_str(&percent_encode(&labels.to_json()));
+        }
+        let connection = connect(&self.endpoint)?;
+        let canceller = BuildCanceller::new(&connection);
+        let mut response = Request::new("POST", &target, HOST)
+            .header("Content-Type", "application/x-tar")
+            .body(Body::Chunked(context))
+            .send(connection)?;
+        if !response.is_success() {
+            return Err(api_error(&mut response));
+        }
+        Ok((
+            BuildStream {
+                lines: LineReader::new(response),
+            },
+            canceller,
+        ))
     }
 
     /// Pulls an image. `progress` is called with each status line the
@@ -662,15 +891,15 @@ fn read_frame(input: &mut impl Read, buf: &mut Vec<u8>) -> Result<Option<Source>
 }
 
 /// Splits a byte stream into lines without holding more than one line.
-struct LineReader<'a, R: Read> {
-    input: &'a mut R,
+struct LineReader<R: Read> {
+    input: R,
     buf: Vec<u8>,
     start: usize,
     eof: bool,
 }
 
-impl<'a, R: Read> LineReader<'a, R> {
-    fn new(input: &'a mut R) -> LineReader<'a, R> {
+impl<R: Read> LineReader<R> {
+    fn new(input: R) -> LineReader<R> {
         LineReader {
             input,
             buf: Vec::new(),
@@ -754,6 +983,42 @@ mod tests {
         ] {
             assert!(check_reference(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn build_events() {
+        let parse = |line: &str| parse_build_event(line).unwrap();
+        assert_eq!(
+            parse(r#"{"stream":"Step 1/3 : FROM alpine\n"}"#),
+            Some(BuildEvent::Output("Step 1/3 : FROM alpine\n".into()))
+        );
+        assert_eq!(
+            parse(
+                r#"{"errorDetail":{"code":2,"message":"The command returned 2"},"error":"The command returned 2"}"#
+            ),
+            Some(BuildEvent::Failed("The command returned 2".into()))
+        );
+        assert_eq!(
+            parse(r#"{"errorDetail":{"message":"only detail"}}"#),
+            Some(BuildEvent::Failed("only detail".into()))
+        );
+        assert_eq!(
+            parse(r#"{"status":"Pull complete","progressDetail":{},"id":"abc"}"#),
+            Some(BuildEvent::Output("abc: Pull complete\n".into()))
+        );
+        assert_eq!(
+            parse(r#"{"status":"Digest: sha256:1234"}"#),
+            Some(BuildEvent::Output("Digest: sha256:1234\n".into()))
+        );
+        // A progress bar update is dropped.
+        assert_eq!(
+            parse(
+                r#"{"status":"Downloading","progressDetail":{"current":5,"total":10},"id":"abc"}"#
+            ),
+            None
+        );
+        assert_eq!(parse(r#"{"aux":{"ID":"sha256:abcd"}}"#), None);
+        assert!(parse_build_event("not json").is_err());
     }
 
     #[test]
