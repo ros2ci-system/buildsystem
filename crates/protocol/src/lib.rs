@@ -20,7 +20,7 @@
 
 pub mod job;
 
-pub use job::{Input, InputSource, JobDescription};
+pub use job::{BuildDefinition, Image, Input, JobDescription, JobKind, Source};
 
 /// Sent with Register. The coordinator refuses versions it does not know.
 pub const PROTOCOL_VERSION: i64 = 1;
@@ -34,6 +34,11 @@ pub const PATH_FINISH: &str = "/worker/v1/finish";
 /// Where a worker uploads one artifact of one attempt.
 pub fn artifact_path(job_id: i64, attempt: i64, relative: &str) -> String {
     format!("/worker/v1/jobs/{job_id}/attempts/{attempt}/artifacts/{relative}")
+}
+
+/// Where a worker downloads a stored file that its job reads.
+pub fn stored_file_path(job_id: i64, attempt: i64, name: &str) -> String {
+    format!("/worker/v1/jobs/{job_id}/attempts/{attempt}/files/{name}")
 }
 
 /// How a job ended, as the worker reports it in Finish.

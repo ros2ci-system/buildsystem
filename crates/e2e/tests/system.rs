@@ -328,6 +328,28 @@ impl System {
         .to_string()
     }
 
+    /// Queues a job from a complete description, and returns its id.
+    fn submit_description(&self, pool: &str, description: &Value) -> String {
+        let file = self
+            .dir
+            .join(format!("job-{}.json", NEXT.fetch_add(1, Ordering::SeqCst)));
+        fs::write(&file, description.to_json_pretty()).unwrap();
+        let (os, arch) = self.platform();
+        self.admin_ok(&[
+            "submit",
+            "--pool",
+            pool,
+            "--os",
+            &os,
+            "--arch",
+            &arch,
+            "--job",
+            file.to_str().unwrap(),
+        ])
+        .trim()
+        .to_string()
+    }
+
     /// The operating system and architecture the agents register with,
     /// read back from the coordinator's log.
     fn platform(&self) -> (String, String) {
@@ -864,4 +886,305 @@ fn the_admin_tool_needs_a_token() {
         log.contains("admin \"second administrator\": created worker token"),
         "{log}"
     );
+}
+
+#[cfg(not(windows))]
+mod image {
+    pub const BUILD_FILE: &str = "FROM docker.io/library/alpine:3.20\nCOPY marker.txt /marker.txt\nRUN echo image-build-step && cat /marker.txt\n";
+    pub const FAILING_BUILD_FILE: &str = "FROM docker.io/library/alpine:3.20\nCOPY marker.txt /marker.txt\nRUN echo doomed-step && exit 9\n";
+    pub const SHOW: &str = "cat /marker.txt; cat /job/in/license.dat";
+}
+
+#[cfg(windows)]
+mod image {
+    pub const BUILD_FILE: &str = "FROM mcr.microsoft.com/windows/nanoserver:ltsc2025\nCOPY marker.txt C:/marker.txt\nRUN echo image-build-step && type C:\\marker.txt\n";
+    pub const FAILING_BUILD_FILE: &str = "FROM mcr.microsoft.com/windows/nanoserver:ltsc2025\nCOPY marker.txt C:/marker.txt\nRUN echo doomed-step && exit 9\n";
+    pub const SHOW: &str = "type C:\\marker.txt& type C:\\job\\in\\license.dat";
+}
+
+/// Removes the images a test built, whatever way the test ends.
+struct BuiltImages {
+    client: ci_container::Client,
+    ids: Vec<String>,
+}
+
+impl Drop for BuiltImages {
+    fn drop(&mut self) {
+        for id in &self.ids {
+            let _ = self.client.remove_image(id);
+        }
+    }
+}
+
+#[test]
+fn an_image_is_built_once_and_jobs_run_in_it() {
+    let Some(mut system) = System::start(
+        false,
+        &[
+            "--max-infrastructure-failures",
+            "2",
+            "--retry-backoff-seconds",
+            "1",
+        ],
+    ) else {
+        return;
+    };
+    system.start_agent("release");
+    let mut built = BuiltImages {
+        client: ci_container::Client::new(
+            ci_container::Endpoint::parse(&system.services.runtime).unwrap(),
+        ),
+        ids: Vec::new(),
+    };
+    // The marker makes this run's image different from every other
+    // run's, so the build is a real one and not a cache hit.
+    let marker = format!("marker-{}-{:?}", std::process::id(), Instant::now());
+    let context = |name: &str, build_file: &str| {
+        let dir = system.dir.join(name);
+        fs::create_dir_all(dir.join("images/test")).unwrap();
+        fs::write(dir.join("images/test/Dockerfile"), build_file).unwrap();
+        fs::write(dir.join("marker.txt"), format!("{marker}\n")).unwrap();
+        system.admin_ok(&[
+            "store-context",
+            &format!("{name}.tar"),
+            dir.to_str().unwrap(),
+        ]);
+    };
+    context("good", image::BUILD_FILE);
+    context("bad", image::FAILING_BUILD_FILE);
+    let license = system.dir.join("license.dat");
+    fs::write(&license, "license-text-for-the-job\n").unwrap();
+    system.admin_ok(&["store-file", "license.dat", license.to_str().unwrap()]);
+    let listing = system.admin_ok(&["list-files"]);
+    for name in ["good.tar", "bad.tar", "license.dat"] {
+        assert!(listing.contains(name), "{listing}");
+    }
+
+    let definition = |name: &str, generation: i64| {
+        Value::object([(
+            "build",
+            Value::object([
+                ("context", Value::from(format!("stored:{name}.tar"))),
+                ("build_file", Value::from("images/test/Dockerfile")),
+                ("generation", Value::Int(generation)),
+            ]),
+        )])
+    };
+    let build_job = |name: &str, generation: i64| {
+        Value::object([
+            ("kind", Value::from("image_build")),
+            ("image", definition(name, generation)),
+            ("timeout_seconds", Value::Int(600)),
+        ])
+    };
+    let run_job = |name: &str, generation: i64| {
+        Value::object([
+            ("image", definition(name, generation)),
+            (
+                "command",
+                Value::strings([PLATFORM.shell[0], PLATFORM.shell[1], image::SHOW]),
+            ),
+            (
+                "inputs",
+                Value::Array(vec![Value::object([
+                    ("name", Value::from("license.dat")),
+                    ("url", Value::from("stored:license.dat")),
+                ])]),
+            ),
+            ("timeout_seconds", Value::Int(120)),
+        ])
+    };
+
+    // An image build job builds the image and reports its id.
+    let job = system.submit_description("release", &build_job("good", 0));
+    let done = system.wait_finished(&job);
+    assert_eq!(
+        str_of(&done, "outcome"),
+        "success",
+        "{}\n{}",
+        done.to_json_pretty(),
+        system.admin_ok(&["log", &job])
+    );
+    let image_id = str_of(&done, "image_id").to_string();
+    assert!(image_id.starts_with("sha256:"), "{image_id}");
+    built.ids.push(image_id.clone());
+    let log = system.admin_ok(&["log", &job]);
+    assert!(log.contains("[agent] building the image"), "{log}");
+    assert!(log.contains("image-build-step"), "{log}");
+    assert!(log.contains(&marker), "{log}");
+
+    // A job that names the same recipe runs in that image without
+    // building it again, and reads its stored input.
+    let job = system.submit_description("release", &run_job("good", 0));
+    let done = system.wait_finished(&job);
+    assert_eq!(
+        str_of(&done, "outcome"),
+        "success",
+        "{}",
+        done.to_json_pretty()
+    );
+    assert_eq!(str_of(&done, "image_id"), image_id);
+    let log = system.admin_ok(&["log", &job]);
+    assert!(log.contains("[agent] the image is already built"), "{log}");
+    assert!(!log.contains("image-build-step"), "{log}");
+    assert!(
+        log.contains(&marker),
+        "the job did not run in the built image:\n{log}"
+    );
+    assert!(log.contains("license-text-for-the-job"), "{log}");
+
+    // Building it again is a success that does nothing.
+    let job = system.submit_description("release", &build_job("good", 0));
+    let done = system.wait_finished(&job);
+    assert_eq!(str_of(&done, "outcome"), "success");
+    assert_eq!(str_of(&done, "image_id"), image_id);
+    assert!(system
+        .admin_ok(&["log", &job])
+        .contains("[agent] the image is already built"));
+
+    // A job with a recipe nobody has built yet builds it on demand. A
+    // new generation of the same recipe counts as one.
+    let job = system.submit_description("release", &run_job("good", 1));
+    let done = system.wait_finished(&job);
+    assert_eq!(
+        str_of(&done, "outcome"),
+        "success",
+        "{}",
+        done.to_json_pretty()
+    );
+    built.ids.push(str_of(&done, "image_id").to_string());
+    let log = system.admin_ok(&["log", &job]);
+    assert!(log.contains("[agent] building the image"), "{log}");
+    assert!(log.contains(&marker), "{log}");
+    assert!(log.contains("license-text-for-the-job"), "{log}");
+
+    // A build file that fails: the job that exists to build it has
+    // failed, once and for all.
+    let job = system.submit_description("release", &build_job("bad", 0));
+    let done = system.wait_finished(&job);
+    assert_eq!(
+        str_of(&done, "outcome"),
+        "build_failure",
+        "{}",
+        done.to_json_pretty()
+    );
+    assert_eq!(done.get("attempt").unwrap().as_i64(), Some(1));
+    assert!(system.admin_ok(&["log", &job]).contains("doomed-step"));
+
+    // A job that only wanted to run in that image has been let down by
+    // something outside itself, and is retried before being given up on.
+    let job = system.submit_description("release", &run_job("bad", 0));
+    let done = system.wait_finished(&job);
+    assert_eq!(
+        str_of(&done, "outcome"),
+        "infrastructure_failure",
+        "{}",
+        done.to_json_pretty()
+    );
+    assert_eq!(done.get("attempt").unwrap().as_i64(), Some(2));
+    assert!(
+        str_of(&done, "message").contains("building the job's image"),
+        "{}",
+        str_of(&done, "message")
+    );
+
+    // Replacing a stored context changes what the same job builds.
+    fs::write(
+        system.dir.join("good/marker.txt"),
+        format!("{marker}-second\n"),
+    )
+    .unwrap();
+    system.admin_ok(&[
+        "store-context",
+        "good.tar",
+        system.dir.join("good").to_str().unwrap(),
+    ]);
+    let job = system.submit_description("release", &build_job("good", 0));
+    let done = system.wait_finished(&job);
+    assert_eq!(
+        str_of(&done, "outcome"),
+        "success",
+        "{}",
+        done.to_json_pretty()
+    );
+    assert_ne!(str_of(&done, "image_id"), image_id);
+    built.ids.push(str_of(&done, "image_id").to_string());
+    assert!(system
+        .admin_ok(&["log", &job])
+        .contains(&format!("{marker}-second")));
+}
+
+#[test]
+fn a_running_image_build_can_be_cancelled() {
+    if cfg!(windows) {
+        eprintln!("skipped: a build cannot be interrupted over a named pipe");
+        return;
+    }
+    let Some(mut system) = System::start(false, &[]) else {
+        return;
+    };
+    let agent = system.start_agent("release");
+    let dir = system.dir.join("slow");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("Dockerfile"),
+        format!(
+            "FROM docker.io/library/alpine:3.20\nRUN echo slow-build-{} && sleep 600\n",
+            std::process::id()
+        ),
+    )
+    .unwrap();
+    system.admin_ok(&["store-context", "slow.tar", dir.to_str().unwrap()]);
+    let description = Value::object([
+        ("kind", Value::from("image_build")),
+        (
+            "image",
+            Value::object([(
+                "build",
+                Value::object([
+                    ("context", Value::from("stored:slow.tar")),
+                    ("build_file", Value::from("Dockerfile")),
+                ]),
+            )]),
+        ),
+        ("timeout_seconds", Value::Int(900)),
+    ]);
+    let job = system.submit_description("release", &description);
+    system.wait_for_log(&job, "slow-build-");
+
+    let started = Instant::now();
+    system.admin_ok(&["cancel", &job]);
+    let done = system.wait_finished(&job);
+    assert_eq!(str_of(&done, "outcome"), "cancelled");
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "the build was not interrupted"
+    );
+    assert_no_job_directories(&system, agent);
+
+    // The same build with a short timeout is stopped at the timeout.
+    let short = Value::object([
+        ("kind", Value::from("image_build")),
+        (
+            "image",
+            Value::object([(
+                "build",
+                Value::object([
+                    ("context", Value::from("stored:slow.tar")),
+                    ("build_file", Value::from("Dockerfile")),
+                    ("generation", Value::Int(1)),
+                ]),
+            )]),
+        ),
+        ("timeout_seconds", Value::Int(4)),
+    ]);
+    let job = system.submit_description("release", &short);
+    let done = system.wait_finished(&job);
+    assert_eq!(
+        str_of(&done, "outcome"),
+        "timeout",
+        "{}",
+        done.to_json_pretty()
+    );
+    assert_eq!(done.get("attempt").unwrap().as_i64(), Some(1));
 }

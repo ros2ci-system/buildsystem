@@ -172,7 +172,10 @@ fn run_job_command(args: &[String]) -> Result<ExitCode, String> {
     // A job run by hand has nobody to report to and nobody to stop it.
     let result = run::run_job(
         &client,
-        &ci_net::Connector::plain_only(),
+        &run::Fetcher {
+            connector: &ci_net::Connector::plain_only(),
+            stored: None,
+        },
         &job,
         &work_dir,
         None,

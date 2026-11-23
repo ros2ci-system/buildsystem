@@ -22,14 +22,18 @@
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ci_container::{Client, ContainerSpec};
+use ci_container::{BuildEvent, BuildOptions, Client, ContainerSpec};
+use ci_crypto::{hex_encode, Sha256};
 use ci_json::Value;
 
 use ci_net::{Connector, Url};
-use ci_protocol::{InputSource, JobDescription, Outcome};
+use ci_protocol::{
+    stored_file_path, BuildDefinition, Image, JobDescription, JobKind, Outcome, Source,
+};
 
 /// The exit code a job uses to say "this failed for a reason outside the
 /// code under test; try again". It is `EX_TEMPFAIL` from `sysexits.h`.
@@ -127,13 +131,30 @@ impl Drop for ContainerGuard<'_> {
     }
 }
 
+/// How the agent fetches the files a job names.
+pub struct Fetcher<'a> {
+    pub connector: &'a Connector,
+    /// Needed for files stored on the coordinator. A job run by hand has
+    /// no coordinator and cannot read them.
+    pub stored: Option<StoredAccess<'a>>,
+}
+
+/// What it takes to download a stored file: the coordinator, the
+/// worker's session token, and the job attempt the file is for.
+pub struct StoredAccess<'a> {
+    pub coordinator: &'a Url,
+    pub token: &'a str,
+    pub job_id: i64,
+    pub attempt: i64,
+}
+
 /// Runs the job and writes its log to `log.txt` and its outputs to `out/`
 /// in `work_dir`. Problems with the runtime, the image or the inputs come
 /// back as an infrastructure failure, not as an error: the only errors
 /// are ones that stop the agent from recording anything at all.
 pub fn run_job(
     client: &Client,
-    connector: &Connector,
+    fetcher: &Fetcher<'_>,
     job: &JobDescription,
     work_dir: &Path,
     owner: Option<&str>,
@@ -144,7 +165,7 @@ pub fn run_job(
     let mut collected = Collected::default();
     let (outcome, exit_code, message) = match run_in_container(
         client,
-        connector,
+        fetcher,
         job,
         work_dir,
         owner,
@@ -158,10 +179,11 @@ pub fn run_job(
             "the job reported an infrastructure problem".to_string(),
         ),
         Ok(Finished::Exited(code)) => (Outcome::BuildFailure, Some(code), String::new()),
-        Ok(Finished::TimedOut) => (
+        Ok(Finished::ImageBuildFailed(message)) => (Outcome::BuildFailure, None, message),
+        Ok(Finished::TimedOut(limit)) => (
             Outcome::Timeout,
             None,
-            format!("killed after the {} second timeout", job.timeout.as_secs()),
+            format!("stopped after the {} second timeout", limit.as_secs()),
         ),
         Ok(Finished::Stopped) => (Outcome::Cancelled, None, "stopped on request".to_string()),
         Err(message) => (Outcome::InfrastructureFailure, None, message),
@@ -179,7 +201,7 @@ pub fn run_job(
 /// What is known about a run whether or not it ended well.
 #[derive(Default)]
 struct Collected {
-    /// The id of the image the container ran.
+    /// The id of the image the container ran, or that the job built.
     image_id: String,
     /// Output files, relative to the work directory.
     outputs: Vec<PathBuf>,
@@ -187,7 +209,10 @@ struct Collected {
 
 enum Finished {
     Exited(i64),
-    TimedOut,
+    /// An image build job whose build file failed.
+    ImageBuildFailed(String),
+    /// Stopped for running past this limit.
+    TimedOut(Duration),
     /// The caller asked for the job to be stopped.
     Stopped,
 }
@@ -196,7 +221,7 @@ enum Finished {
 /// what went wrong.
 fn run_in_container(
     client: &Client,
-    connector: &Connector,
+    fetcher: &Fetcher<'_>,
     job: &JobDescription,
     work_dir: &Path,
     owner: Option<&str>,
@@ -210,33 +235,94 @@ fn run_in_container(
         .is_some_and(|os| os.eq_ignore_ascii_case("windows"));
     let layout = if windows { &WINDOWS } else { &LINUX };
 
-    // Images are named by digest, so one that is already present is the
-    // right one and there is nothing to gain from asking the registry.
-    let present = client
-        .image_exists(&job.image)
-        .map_err(|e| format!("checking for image {}: {e}", job.image))?;
-    if !present {
-        eprintln!("pulling {}", job.image);
-        // A pull can take many minutes. The monitor is called as progress
-        // arrives, so the caller is not left silent for the whole of it.
-        let mut stop = false;
-        client
-            .pull_image(&job.image, |_| stop |= monitor() == Control::Stop)
-            .map_err(|e| format!("pulling image {}: {e}", job.image))?;
-        if stop {
-            return Ok(Finished::Stopped);
+    // One log for the whole job: an image build, if there is one, and
+    // then the container's output.
+    let log_path = work_dir.join("log.txt");
+    let mut log_file =
+        File::create(&log_path).map_err(|e| format!("creating the log file: {e}"))?;
+
+    let image = match &job.image {
+        Image::Reference(reference) => {
+            // Images are named by digest, so one that is already present
+            // is the right one and there is nothing to gain from asking
+            // the registry.
+            let present = client
+                .image_exists(reference)
+                .map_err(|e| format!("checking for image {reference}: {e}"))?;
+            if !present {
+                eprintln!("pulling {reference}");
+                // A pull can take many minutes. The monitor is called as
+                // progress arrives, so the caller is not left silent for
+                // the whole of it.
+                let mut stop = false;
+                client
+                    .pull_image(reference, |_| stop |= monitor() == Control::Stop)
+                    .map_err(|e| format!("pulling image {reference}: {e}"))?;
+                if stop {
+                    return Ok(Finished::Stopped);
+                }
+            }
+            reference.clone()
         }
+        Image::Build(build) => {
+            let limit = job.build_timeout();
+            match ensure_built(
+                client,
+                fetcher,
+                build,
+                windows,
+                work_dir,
+                &mut log_file,
+                limit,
+                monitor,
+            )? {
+                Built::Ready(tag) => tag,
+                Built::Stopped => return Ok(Finished::Stopped),
+                // Whose failure a failed build is depends on what was
+                // asked for. A job that exists to build the image has
+                // failed. A job that only needed the image to run in has
+                // been let down by something outside itself.
+                Built::TimedOut if job.kind == JobKind::ImageBuild => {
+                    return Ok(Finished::TimedOut(limit))
+                }
+                Built::TimedOut => {
+                    return Err(format!(
+                        "building the job's image took longer than {} seconds",
+                        limit.as_secs()
+                    ))
+                }
+                Built::Failed(message) if job.kind == JobKind::ImageBuild => {
+                    return Ok(Finished::ImageBuildFailed(message))
+                }
+                Built::Failed(message) => {
+                    return Err(format!("building the job's image: {message}"))
+                }
+            }
+        }
+    };
+
+    if job.kind == JobKind::ImageBuild {
+        collected.image_id = client
+            .image_id(&image)
+            .map_err(|e| format!("checking the built image: {e}"))?
+            .unwrap_or_default();
+        return Ok(Finished::Exited(0));
     }
 
     // Inputs are fetched before the container exists, so a download that
     // fails costs nothing to clean up.
     let downloads = work_dir.join("inputs");
     for input in &job.inputs {
-        if let InputSource::Url(url) = &input.source {
+        if !matches!(input.source, Source::LocalFile(_)) {
             fs::create_dir_all(&downloads)
                 .map_err(|e| format!("preparing the job's inputs: {e}"))?;
-            let stopped = download(connector, url, &downloads.join(&input.name), monitor)
-                .map_err(|e| format!("input {}: {e}", input.name))?;
+            let stopped = fetch(
+                fetcher,
+                &input.source,
+                &downloads.join(&input.name),
+                monitor,
+            )
+            .map_err(|e| format!("input {}: {e}", input.name))?;
             if stopped {
                 return Ok(Finished::Stopped);
             }
@@ -247,7 +333,7 @@ fn run_in_container(
     environment.retain(|(name, _)| name != "CI_JOB_DIR");
     environment.push(("CI_JOB_DIR".to_string(), layout.job_dir.to_string()));
     let spec = ContainerSpec {
-        image: job.image.clone(),
+        image,
         command: job.command.clone(),
         environment,
         working_dir: None,
@@ -279,9 +365,6 @@ fn run_in_container(
     let _ = fs::remove_file(&archive_path);
     let _ = fs::remove_dir_all(&downloads);
     uploaded?;
-
-    let log_path = work_dir.join("log.txt");
-    let log_file = File::create(&log_path).map_err(|e| format!("creating the log file: {e}"))?;
 
     client
         .start_container(id)
@@ -355,7 +438,7 @@ fn run_in_container(
         return Ok(Finished::Stopped);
     }
     if timed_out {
-        return Ok(Finished::TimedOut);
+        return Ok(Finished::TimedOut(job.timeout));
     }
     if !state.error.is_empty() {
         return Err(format!("the container runtime reported: {}", state.error));
@@ -364,6 +447,161 @@ fn run_in_container(
         return Err("the container was killed for running out of memory".to_string());
     }
     Ok(Finished::Exited(state.exit_code))
+}
+
+enum Built {
+    /// The image is in the local store under this name.
+    Ready(String),
+    /// The build file failed, and why.
+    Failed(String),
+    TimedOut,
+    Stopped,
+}
+
+/// Makes sure the image a build definition describes is in the local
+/// store, building it if it is not. The build's output goes to `log`.
+///
+/// An image is a cache. The name it is kept under comes from the recipe,
+/// so a recipe is built once per worker and reused until it changes.
+#[allow(clippy::too_many_arguments)]
+fn ensure_built(
+    client: &Client,
+    fetcher: &Fetcher<'_>,
+    build: &BuildDefinition,
+    windows: bool,
+    work_dir: &Path,
+    log: &mut File,
+    limit: Duration,
+    monitor: &mut dyn FnMut() -> Control,
+) -> Result<Built, String> {
+    let expected = build
+        .context_sha256
+        .as_deref()
+        .ok_or("the build context's hash is not known, so the image cannot be named")?;
+    let tag = build.local_tag().ok_or("the image cannot be named")?;
+    let note = |log: &mut File, text: String| {
+        let _ = log.write_all(text.as_bytes());
+        let _ = log.flush();
+    };
+    if client
+        .image_exists(&tag)
+        .map_err(|e| format!("checking for image {tag}: {e}"))?
+    {
+        note(log, format!("[agent] the image is already built: {tag}\n"));
+        return Ok(Built::Ready(tag));
+    }
+
+    let context_path = work_dir.join("context.tar");
+    let stopped = fetch(fetcher, &build.context, &context_path, monitor)
+        .map_err(|e| format!("fetching the build context: {e}"))?;
+    if stopped {
+        let _ = fs::remove_file(&context_path);
+        return Ok(Built::Stopped);
+    }
+    let actual = hash_file(&context_path).map_err(|e| format!("reading the build context: {e}"))?;
+    if !actual.eq_ignore_ascii_case(expected) {
+        let _ = fs::remove_file(&context_path);
+        return Err(format!(
+            "the build context is not the one the job named: its SHA-256 is {actual}, not {expected}"
+        ));
+    }
+
+    note(
+        log,
+        format!(
+            "[agent] building the image from {}: {tag}\n",
+            build.build_file
+        ),
+    );
+    let options = BuildOptions {
+        tag: tag.clone(),
+        build_file: build.build_file.clone(),
+        // As for containers: Windows 11 would default to Hyper-V.
+        isolation: windows.then(|| "process".to_string()),
+        labels: Vec::new(),
+    };
+    let started = File::open(&context_path)
+        .map_err(|e| format!("reading the build context: {e}"))
+        .and_then(|mut context| {
+            client
+                .build_image(&options, &mut context)
+                .map_err(|e| format!("starting the build: {e}"))
+        });
+    let _ = fs::remove_file(&context_path);
+    let (mut stream, canceller) = started?;
+
+    // The build's progress is read on another thread, so that this one
+    // keeps calling the monitor through a step that prints nothing for
+    // a long time.
+    let (sender, events) = mpsc::channel::<Result<BuildEvent, String>>();
+    thread::spawn(move || loop {
+        let message = match stream.next_event() {
+            Ok(Some(event)) => Ok(event),
+            Ok(None) => return,
+            Err(e) => Err(e.to_string()),
+        };
+        let last = message.is_err();
+        if sender.send(message).is_err() || last {
+            return;
+        }
+    });
+
+    let deadline = Instant::now() + limit;
+    let mut failure: Option<String> = None;
+    let mut ending: Option<Built> = None;
+    loop {
+        match events.recv_timeout(POLL_INTERVAL) {
+            Ok(Ok(BuildEvent::Output(text))) => note(log, text),
+            Ok(Ok(BuildEvent::Failed(message))) => failure = Some(message),
+            // After a cancel the connection is closed, and reading from
+            // it fails. That is the cancel working, not a new problem.
+            Ok(Err(message)) => {
+                if ending.is_none() && failure.is_none() {
+                    failure = Some(message);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if ending.is_none() {
+            let reason = if monitor() == Control::Stop {
+                Some(Built::Stopped)
+            } else if Instant::now() >= deadline {
+                Some(Built::TimedOut)
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                ending = Some(reason);
+                if !canceller.cancel() {
+                    // The build cannot be interrupted here. Stop waiting
+                    // for it; it runs on until it ends by itself.
+                    note(
+                        log,
+                        "[agent] the build could not be interrupted and was left to finish\n"
+                            .to_string(),
+                    );
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(ending) = ending {
+        return Ok(ending);
+    }
+    if let Some(message) = failure {
+        note(log, format!("[agent] the build failed: {message}\n"));
+        return Ok(Built::Failed(message));
+    }
+    if !client
+        .image_exists(&tag)
+        .map_err(|e| format!("checking for image {tag}: {e}"))?
+    {
+        return Ok(Built::Failed(
+            "the build ended without producing the image".to_string(),
+        ));
+    }
+    Ok(Built::Ready(tag))
 }
 
 /// Builds the archive that sets up the job directory: the parameters
@@ -383,8 +621,8 @@ fn build_upload_archive(job: &JobDescription, downloads: &Path, path: &Path) -> 
     builder.append_dir("job/in", 0o755).map_err(err)?;
     for input in &job.inputs {
         let source = match &input.source {
-            InputSource::LocalFile(source) => source.clone(),
-            InputSource::Url(_) => downloads.join(&input.name),
+            Source::LocalFile(source) => source.clone(),
+            Source::Url(_) | Source::Stored(_) => downloads.join(&input.name),
         };
         let mut file = File::open(&source)
             .map_err(|e| format!("input {}: {}: {e}", input.name, source.display()))?;
@@ -416,40 +654,87 @@ fn build_upload_archive(job: &JobDescription, downloads: &Path, path: &Path) -> 
         .map_err(|e| e.to_string())
 }
 
-/// Downloads a URL to a file. Returns `true` if the caller asked for the
+/// Fetches a file to `path`. Returns `true` if the caller asked for the
 /// job to be stopped part-way.
-fn download(
-    connector: &Connector,
-    url: &str,
+fn fetch(
+    fetcher: &Fetcher<'_>,
+    source: &Source,
     path: &Path,
     monitor: &mut dyn FnMut() -> Control,
 ) -> Result<bool, String> {
-    let parsed = Url::parse(url).map_err(|e| e.to_string())?;
-    let host = parsed.host_header();
-    let mut response = connector
-        .send(&parsed, ci_http::Request::new("GET", &parsed.target, &host))
-        .map_err(|e| format!("downloading {url}: {e}"))?;
+    let (url, authorization, what) = match source {
+        Source::LocalFile(local) => {
+            fs::copy(local, path).map_err(|e| format!("{}: {e}", local.display()))?;
+            return Ok(false);
+        }
+        Source::Url(url) => (
+            Url::parse(url).map_err(|e| e.to_string())?,
+            None,
+            url.clone(),
+        ),
+        Source::Stored(name) => {
+            let access = fetcher
+                .stored
+                .as_ref()
+                .ok_or("stored files can only be read by a job that came from a coordinator")?;
+            // The session token goes to the coordinator and nowhere else:
+            // this URL is built from the coordinator's own address.
+            (
+                access.coordinator.with_target(&stored_file_path(
+                    access.job_id,
+                    access.attempt,
+                    name,
+                )),
+                Some(format!("Bearer {}", access.token)),
+                format!("stored file {name}"),
+            )
+        }
+    };
+    let host = url.host_header();
+    let mut request = ci_http::Request::new("GET", &url.target, &host);
+    if let Some(value) = &authorization {
+        request = request.header("Authorization", value);
+    }
+    let mut response = fetcher
+        .connector
+        .send(&url, request)
+        .map_err(|e| format!("downloading {what}: {e}"))?;
     if response.status != 200 {
         return Err(format!(
-            "downloading {url}: the server answered {}",
+            "downloading {what}: the server answered {}",
             response.status
         ));
     }
-    let mut file = File::create(path).map_err(|e| format!("saving {url}: {e}"))?;
+    let mut file = File::create(path).map_err(|e| format!("saving {what}: {e}"))?;
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
         let n = match response.read(&mut buffer) {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(format!("downloading {url}: {e}")),
+            Err(e) => return Err(format!("downloading {what}: {e}")),
         };
         file.write_all(&buffer[..n])
-            .map_err(|e| format!("saving {url}: {e}"))?;
+            .map_err(|e| format!("saving {what}: {e}"))?;
         if monitor() == Control::Stop {
             return Ok(true);
         }
     }
-    file.flush().map_err(|e| format!("saving {url}: {e}"))?;
+    file.flush().map_err(|e| format!("saving {what}: {e}"))?;
     Ok(false)
+}
+
+/// The SHA-256 of a file, in hex.
+fn hash_file(path: &Path) -> io::Result<String> {
+    let mut file = File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buffer[..n]);
+    }
+    Ok(hex_encode(&hash.finish()))
 }

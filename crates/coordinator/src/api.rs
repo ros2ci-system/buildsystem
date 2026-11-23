@@ -19,7 +19,10 @@ use ci_crypto::{base64_decode, hex_encode, random_token, sha256, Sha256};
 use ci_http::server::{path_segments, Request, Response};
 use ci_json::Value;
 use ci_postgres::Error as DbError;
-use ci_protocol::{is_safe_artifact_path, Action, JobDescription, Outcome, PROTOCOL_VERSION};
+use ci_protocol::job::{is_plain_file_name, set_context_sha256};
+use ci_protocol::{
+    is_safe_artifact_path, Action, Image, JobDescription, Outcome, Source, PROTOCOL_VERSION,
+};
 
 use crate::db::{self, Artifact, Db, Requeue, Worker};
 
@@ -163,8 +166,50 @@ impl Coordinator {
                     .map_err(|_| reject(404, "no such attempt"))?;
                 self.upload_artifact(&worker, job_id, attempt, &rest.join("/"), request)
             }
+            ("GET", ["worker", "v1", "jobs", job_id, "attempts", attempt, "files", name]) => {
+                let worker = self.authenticate(request)?;
+                let job_id: i64 = job_id.parse().map_err(|_| reject(404, "no such job"))?;
+                let attempt: i64 = attempt
+                    .parse()
+                    .map_err(|_| reject(404, "no such attempt"))?;
+                self.download_stored_file(&worker, job_id, attempt, name)
+            }
             _ => Err(reject(404, "not found")),
         }
+    }
+
+    /// Serves a stored file to the worker running a job that reads it.
+    /// No other worker, and no other job, can fetch it: that is what
+    /// keeps a private input, such as a license, to the jobs that were
+    /// given it.
+    fn download_stored_file(
+        &self,
+        worker: &Worker,
+        job_id: i64,
+        attempt: i64,
+        name: &str,
+    ) -> Result<Response, Reject> {
+        let description = self
+            .db
+            .held_job_description(job_id, worker.id, attempt)?
+            .ok_or_else(|| reject(409, "this job no longer belongs to this worker"))?;
+        let job = JobDescription::parse(&description).map_err(|e| {
+            eprintln!("error: job {job_id} has an unreadable description: {e}");
+            reject(500, "internal error")
+        })?;
+        if !job.stored_files().contains(&name) {
+            return Err(reject(404, "this job does not read that file"));
+        }
+        let stored = self
+            .db
+            .stored_file(name)?
+            .ok_or_else(|| reject(404, "no such stored file"))?;
+        let file = File::open(self.stored_file_path(name))?;
+        Ok(Response::file(
+            "application/octet-stream",
+            file,
+            stored.size as u64,
+        ))
     }
 
     fn authenticate(&self, request: &Request<'_>) -> Result<Worker, Reject> {
@@ -222,10 +267,22 @@ impl Coordinator {
         };
         // The stored description was validated when the job was
         // submitted, so it parses.
-        let description = ci_json::parse(&job.description).map_err(|e| {
+        let mut description = ci_json::parse(&job.description).map_err(|e| {
             eprintln!("error: job {} has an unreadable description: {e}", job.id);
             reject(500, "internal error")
         })?;
+        // A stored build context is named, not pinned, in the stored
+        // description. The worker is told its hash as of now, which is
+        // also what names the image the recipe makes.
+        if let Ok(parsed) = JobDescription::parse(&job.description) {
+            if let Image::Build(build) = &parsed.image {
+                if let Source::Stored(name) = &build.context {
+                    if let Some(stored) = self.db.stored_file(name)? {
+                        set_context_sha256(&mut description, &stored.sha256);
+                    }
+                }
+            }
+        }
         eprintln!(
             "job {} attempt {} claimed by worker {}",
             job.id, job.attempt, worker.id
@@ -501,6 +558,16 @@ impl Coordinator {
                 eprintln!("admin {admin:?}: revoked worker token {id}");
                 Ok(json_ok(Value::object([("revoked", Value::Bool(true))])))
             }
+            ("GET", ["admin", "v1", "files"]) => self.list_stored_files(),
+            ("PUT", ["admin", "v1", "files", name]) => self.put_stored_file(&admin, name, request),
+            ("DELETE", ["admin", "v1", "files", name]) => {
+                if !is_plain_file_name(name) || !self.db.delete_stored_file(name)? {
+                    return Err(reject(404, "no such stored file"));
+                }
+                let _ = fs::remove_file(self.stored_file_path(name));
+                eprintln!("admin {admin:?}: deleted stored file {name}");
+                Ok(json_ok(Value::object([("deleted", Value::Bool(true))])))
+            }
             ("POST", ["admin", "v1", "jobs"]) => self.submit_job(&admin, request),
             ("GET", ["admin", "v1", "jobs", id]) => self.job_status(job(id)?),
             ("POST", ["admin", "v1", "jobs", id, "cancel"]) => self.cancel_job(&admin, job(id)?),
@@ -577,6 +644,82 @@ impl Coordinator {
         ))
     }
 
+    fn list_stored_files(&self) -> Result<Response, Reject> {
+        let files = self.db.stored_files()?;
+        Ok(json_ok(Value::object([(
+            "files",
+            Value::Array(
+                files
+                    .into_iter()
+                    .map(|f| {
+                        Value::object([
+                            ("name", Value::from(f.path)),
+                            ("size", Value::Int(f.size)),
+                            ("sha256", Value::from(f.sha256)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        )])))
+    }
+
+    /// Stores a file under a name, replacing any earlier one. Jobs that
+    /// name it read whatever is stored when they run.
+    fn put_stored_file(
+        &self,
+        admin: &str,
+        name: &str,
+        request: &mut Request<'_>,
+    ) -> Result<Response, Reject> {
+        if !is_plain_file_name(name) {
+            return Err(reject(400, "the file name must be a plain file name"));
+        }
+        if request
+            .content_length
+            .is_some_and(|len| len > self.settings.max_artifact_bytes)
+        {
+            return Err(reject(413, "the file is too large"));
+        }
+        let target = self.stored_file_path(name);
+        let parent = target
+            .parent()
+            .ok_or_else(|| reject(400, "bad file name"))?;
+        fs::create_dir_all(parent)?;
+        let temporary = parent.join(format!(".upload-{}", random_token(8)));
+        let (size, digest) =
+            match receive_file(&temporary, request.body, self.settings.max_artifact_bytes) {
+                Ok(Some(result)) => result,
+                Ok(None) => {
+                    let _ = fs::remove_file(&temporary);
+                    return Err(reject(413, "the file is too large"));
+                }
+                Err(e) => {
+                    let _ = fs::remove_file(&temporary);
+                    return Err(Reject(400, format!("the upload did not complete: {e}")));
+                }
+            };
+        if request.content_length.is_some_and(|len| len != size) {
+            let _ = fs::remove_file(&temporary);
+            return Err(reject(400, "the upload did not complete"));
+        }
+        fs::rename(&temporary, &target)?;
+        let stored = Artifact {
+            path: name.to_string(),
+            size: size as i64,
+            sha256: hex_encode(&digest),
+        };
+        self.db.put_stored_file(&stored)?;
+        eprintln!(
+            "admin {admin:?}: stored file {name} ({size} bytes, sha256 {})",
+            stored.sha256
+        );
+        Ok(json_ok(Value::object([
+            ("name", Value::from(name)),
+            ("size", Value::Int(stored.size)),
+            ("sha256", Value::from(stored.sha256)),
+        ])))
+    }
+
     fn submit_job(&self, admin: &str, request: &mut Request<'_>) -> Result<Response, Reject> {
         let body = read_json(request)?;
         let pool = str_field(&body, "pool")?;
@@ -599,8 +742,17 @@ impl Coordinator {
             // submitter names from its own disk.
             return Err(reject(
                 400,
-                "job description: inputs must be http:// or https:// URLs",
+                "job description: files must come from http://, https:// or stored: URLs",
             ));
+        }
+        // A job that names a file nobody has stored could never run.
+        for name in parsed.stored_files() {
+            if self.db.stored_file(name)?.is_none() {
+                return Err(Reject(
+                    400,
+                    format!("job description: there is no stored file named {name:?}"),
+                ));
+            }
         }
         let id = self.db.submit_job(pool, os, arch, &description)?;
         eprintln!("admin {admin:?}: submitted job {id}: pool {pool}, {os}/{arch}");
@@ -707,6 +859,10 @@ impl Coordinator {
     // -----------------------------------------------------------------
     // Storage layout
     // -----------------------------------------------------------------
+
+    fn stored_file_path(&self, name: &str) -> PathBuf {
+        self.settings.data_dir.join("files").join(name)
+    }
 
     fn attempt_dir(&self, job_id: i64, attempt: i64) -> PathBuf {
         self.settings

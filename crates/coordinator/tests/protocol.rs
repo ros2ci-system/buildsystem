@@ -1391,3 +1391,347 @@ fn a_revoked_worker_token_shuts_its_workers_out() {
         404
     );
 }
+
+fn build_job(context: &str, extra: &[(&str, Value)]) -> Value {
+    let mut description = vec![
+        (
+            "image".to_string(),
+            Value::object([(
+                "build",
+                Value::object([
+                    ("context", Value::from(context)),
+                    ("build_file", Value::from("images/test/Dockerfile")),
+                ]),
+            )]),
+        ),
+        ("timeout_seconds".to_string(), Value::Int(60)),
+    ];
+    for (key, value) in extra {
+        description.push((key.to_string(), value.clone()));
+    }
+    Value::object([
+        ("pool", Value::from("release")),
+        ("os", Value::from("linux")),
+        ("arch", Value::from("amd64")),
+        ("description", Value::Object(description)),
+    ])
+}
+
+#[test]
+fn stored_files_reach_only_the_jobs_that_name_them() {
+    let Some(c) = Coordinator::start(&[]) else {
+        return;
+    };
+    let put = |name: &str, data: &[u8]| {
+        c.call(
+            &c.admin_url,
+            "PUT",
+            &format!("/admin/v1/files/{name}"),
+            None,
+            Some(data),
+        )
+    };
+
+    // A job cannot name a file that nobody has stored.
+    let (status, reply) = c.admin(
+        "POST",
+        "/admin/v1/jobs",
+        Some(build_job(
+            "stored:context.tar",
+            &[("kind", Value::from("image_build"))],
+        )),
+    );
+    assert_eq!(status, 400, "{reply:?}");
+
+    let (status, body) = put("context.tar", b"first context");
+    assert_eq!(status, 200);
+    let stored = ci_json::parse_bytes(&body).unwrap();
+    assert_eq!(
+        str_of(&stored, "sha256"),
+        hex_encode(&sha256(b"first context"))
+    );
+    assert_eq!(put("license.dat", b"the license").0, 200);
+    for bad in ["..%2Fescape", "a%2Fb", "trailing.", "sp%20ace"] {
+        let (status, _) = put(bad, b"x");
+        assert!(status == 400 || status == 404, "{bad} got {status}");
+    }
+    let (_, listing) = c.admin("GET", "/admin/v1/files", None);
+    let names: Vec<&str> = listing
+        .get("files")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| str_of(f, "name"))
+        .collect();
+    assert_eq!(names, ["context.tar", "license.dat"]);
+
+    // Three jobs: one builds from the context, one reads the license as
+    // an input, and one reads neither.
+    let (status, reply) = c.admin(
+        "POST",
+        "/admin/v1/jobs",
+        Some(build_job(
+            "stored:context.tar",
+            &[("kind", Value::from("image_build"))],
+        )),
+    );
+    assert_eq!(status, 201, "{reply:?}");
+    let build_id = reply.get("job_id").unwrap().as_i64().unwrap();
+    let licensed = Value::object([
+        ("pool", Value::from("release")),
+        ("os", Value::from("linux")),
+        ("arch", Value::from("amd64")),
+        (
+            "description",
+            Value::object([
+                ("image", Value::from("registry.example/image@sha256:0123")),
+                ("command", Value::strings(["run"])),
+                ("timeout_seconds", Value::Int(60)),
+                (
+                    "inputs",
+                    Value::Array(vec![Value::object([
+                        ("name", Value::from("license.dat")),
+                        ("url", Value::from("stored:license.dat")),
+                    ])]),
+                ),
+            ]),
+        ),
+    ]);
+    let (status, reply) = c.admin("POST", "/admin/v1/jobs", Some(licensed));
+    assert_eq!(status, 201, "{reply:?}");
+    let licensed_id = reply.get("job_id").unwrap().as_i64().unwrap();
+    let plain_id = c.submit("release", "linux", "amd64");
+
+    let builder = c.register("release", "linux", "amd64");
+    let reader = c.register("release", "linux", "amd64");
+    let other = c.register("release", "linux", "amd64");
+
+    // The worker that claims the build is told the context's hash.
+    let (status, reply) = c.worker("/worker/v1/claim", &builder, Value::object::<&str>([]));
+    assert_eq!(status, 200);
+    let job = reply.get("job").unwrap();
+    assert_eq!(job.get("job_id").unwrap().as_i64(), Some(build_id));
+    let build = job
+        .get("description")
+        .unwrap()
+        .get("image")
+        .unwrap()
+        .get("build")
+        .unwrap();
+    assert_eq!(
+        str_of(build, "context_sha256"),
+        hex_encode(&sha256(b"first context"))
+    );
+    assert_eq!(
+        str_of(job.get("description").unwrap(), "kind"),
+        "image_build"
+    );
+
+    let (_, reply) = c.worker("/worker/v1/claim", &reader, Value::object::<&str>([]));
+    assert_eq!(
+        reply.get("job").unwrap().get("job_id").unwrap().as_i64(),
+        Some(licensed_id)
+    );
+    let (_, reply) = c.worker("/worker/v1/claim", &other, Value::object::<&str>([]));
+    assert_eq!(
+        reply.get("job").unwrap().get("job_id").unwrap().as_i64(),
+        Some(plain_id)
+    );
+
+    let fetch = |token: Option<&str>, job_id: i64, name: &str| {
+        c.raw(
+            &c.worker_url,
+            "GET",
+            &format!("/worker/v1/jobs/{job_id}/attempts/1/files/{name}"),
+            token,
+            None,
+        )
+    };
+    // Each worker gets the file its own job names.
+    assert_eq!(
+        fetch(Some(&builder), build_id, "context.tar"),
+        (200, b"first context".to_vec())
+    );
+    assert_eq!(
+        fetch(Some(&reader), licensed_id, "license.dat"),
+        (200, b"the license".to_vec())
+    );
+    // And nothing else: not a file its job does not name,
+    assert_eq!(fetch(Some(&builder), build_id, "license.dat").0, 404);
+    assert_eq!(fetch(Some(&other), plain_id, "license.dat").0, 404);
+    // not through another worker's job,
+    assert_eq!(fetch(Some(&other), licensed_id, "license.dat").0, 409);
+    assert_eq!(fetch(Some(&builder), licensed_id, "license.dat").0, 409);
+    // not without a token, with a made-up one, or with an admin token,
+    assert_eq!(fetch(None, licensed_id, "license.dat").0, 401);
+    assert_eq!(
+        fetch(Some("not-a-token"), licensed_id, "license.dat").0,
+        401
+    );
+    assert_eq!(
+        fetch(Some(&c.admin_token()), licensed_id, "license.dat").0,
+        401
+    );
+    // and not by a path that tries to leave the store.
+    for bad in [
+        "..%2Flicense.dat",
+        "%2e%2e",
+        "license.dat%2F..%2Fcontext.tar",
+    ] {
+        let status = fetch(Some(&reader), licensed_id, bad).0;
+        assert!(status == 400 || status == 404, "{bad} got {status}");
+    }
+    for response in [
+        fetch(Some(&other), licensed_id, "license.dat"),
+        fetch(None, licensed_id, "license.dat"),
+    ] {
+        assert!(!String::from_utf8_lossy(&response.1).contains("the license"));
+    }
+
+    // Once the job is finished, its worker can no longer fetch the file.
+    assert_eq!(
+        c.finish(&reader, (licensed_id, 1), "success", vec![]).0,
+        200
+    );
+    assert_eq!(fetch(Some(&reader), licensed_id, "license.dat").0, 409);
+
+    // A stored file can be replaced. A job reads what is stored when it
+    // runs, and a build is told the new hash.
+    assert_eq!(put("context.tar", b"second context").0, 200);
+    assert_eq!(
+        fetch(Some(&builder), build_id, "context.tar"),
+        (200, b"second context".to_vec())
+    );
+    assert_eq!(c.finish(&builder, (build_id, 1), "success", vec![]).0, 200);
+    let (_, reply) = c.admin(
+        "POST",
+        "/admin/v1/jobs",
+        Some(build_job(
+            "stored:context.tar",
+            &[("kind", Value::from("image_build"))],
+        )),
+    );
+    let again = reply.get("job_id").unwrap().as_i64().unwrap();
+    let (_, reply) = c.worker("/worker/v1/claim", &builder, Value::object::<&str>([]));
+    let job = reply.get("job").unwrap();
+    assert_eq!(job.get("job_id").unwrap().as_i64(), Some(again));
+    let build = job
+        .get("description")
+        .unwrap()
+        .get("image")
+        .unwrap()
+        .get("build")
+        .unwrap();
+    assert_eq!(
+        str_of(build, "context_sha256"),
+        hex_encode(&sha256(b"second context"))
+    );
+
+    // Deleting.
+    assert_eq!(
+        c.call(
+            &c.admin_url,
+            "DELETE",
+            "/admin/v1/files/license.dat",
+            None,
+            None
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        c.call(
+            &c.admin_url,
+            "DELETE",
+            "/admin/v1/files/license.dat",
+            None,
+            None
+        )
+        .0,
+        404
+    );
+    let (_, listing) = c.admin("GET", "/admin/v1/files", None);
+    assert_eq!(listing.get("files").unwrap().as_array().unwrap().len(), 1);
+    // Storing needs an admin token like everything else on that API.
+    assert_eq!(
+        c.raw(
+            &c.admin_url,
+            "PUT",
+            "/admin/v1/files/x",
+            Some(&builder),
+            Some(b"x")
+        )
+        .0,
+        401
+    );
+    assert_eq!(
+        c.raw(&c.admin_url, "GET", "/admin/v1/files", None, None).0,
+        401
+    );
+}
+
+#[test]
+fn build_definitions_are_checked_at_submission() {
+    let Some(c) = Coordinator::start(&[]) else {
+        return;
+    };
+    assert_eq!(
+        c.call(
+            &c.admin_url,
+            "PUT",
+            "/admin/v1/files/context.tar",
+            None,
+            Some(b"context")
+        )
+        .0,
+        200
+    );
+    let hash = hex_encode(&sha256(b"anything"));
+    let pinned = |context: &str, hash: Option<&str>| {
+        let mut build = vec![
+            ("context", Value::from(context)),
+            ("build_file", Value::from("Dockerfile")),
+        ];
+        if let Some(hash) = hash {
+            build.push(("context_sha256", Value::from(hash)));
+        }
+        Value::object([
+            ("pool", Value::from("release")),
+            ("os", Value::from("linux")),
+            ("arch", Value::from("amd64")),
+            (
+                "description",
+                Value::object([
+                    ("image", Value::object([("build", Value::object(build))])),
+                    ("command", Value::strings(["run"])),
+                    ("timeout_seconds", Value::Int(60)),
+                ]),
+            ),
+        ])
+    };
+    let submit = |body: Value| c.admin("POST", "/admin/v1/jobs", Some(body)).0;
+    assert_eq!(submit(pinned("stored:context.tar", None)), 201);
+    assert_eq!(
+        submit(pinned("https://example.com/c.tar", Some(&hash))),
+        201
+    );
+    // A context from a URL with nothing to pin it.
+    assert_eq!(submit(pinned("https://example.com/c.tar", None)), 400);
+    // A context read from the worker's own disk.
+    assert_eq!(submit(pinned("file:///etc", Some(&hash))), 400);
+    assert_eq!(submit(pinned("stored:no-such-context.tar", None)), 400);
+    // An image build job that also tries to run something.
+    assert_eq!(
+        submit(build_job(
+            "stored:context.tar",
+            &[
+                ("kind", Value::from("image_build")),
+                ("command", Value::strings(["run"]))
+            ]
+        )),
+        400
+    );
+    // A run job with a build definition but no command.
+    assert_eq!(submit(build_job("stored:context.tar", &[])), 400);
+}

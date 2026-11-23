@@ -79,6 +79,13 @@ const MIGRATIONS: &[&str] = &[
         revoked boolean NOT NULL DEFAULT false,
         created_at timestamptz NOT NULL DEFAULT now()
     );",
+    // 3: files stored on the coordinator for jobs to read.
+    "CREATE TABLE stored_files (
+        name text PRIMARY KEY,
+        size bigint NOT NULL,
+        sha256 text NOT NULL,
+        updated_at timestamptz NOT NULL DEFAULT now()
+    );",
 ];
 
 const TIMESTAMP: &str = "'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'";
@@ -201,6 +208,71 @@ impl Db {
         }
         let connection = guard.as_mut().expect("the connection was just set");
         body(connection)
+    }
+
+    /// Records a stored file, replacing any earlier one of that name.
+    pub fn put_stored_file(&self, file: &Artifact) -> Result<(), Error> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO stored_files (name, size, sha256) VALUES ($1, $2, $3)
+                 ON CONFLICT (name) DO UPDATE
+                 SET size = excluded.size, sha256 = excluded.sha256, updated_at = now()",
+                &[(&file.path).into(), file.size.into(), (&file.sha256).into()],
+            )
+            .map(|_| ())
+        })
+    }
+
+    /// A stored file's size and hash, with its name in `path`.
+    pub fn stored_file(&self, name: &str) -> Result<Option<Artifact>, Error> {
+        self.with(|c| {
+            c.query(
+                "SELECT name, size, sha256 FROM stored_files WHERE name = $1",
+                &[name.into()],
+            )?
+            .first()
+            .map(artifact_from_row)
+            .transpose()
+        })
+    }
+
+    pub fn stored_files(&self) -> Result<Vec<Artifact>, Error> {
+        self.with(|c| {
+            c.query(
+                "SELECT name, size, sha256 FROM stored_files ORDER BY name",
+                &[],
+            )?
+            .iter()
+            .map(artifact_from_row)
+            .collect()
+        })
+    }
+
+    /// Forgets a stored file. Returns `false` when there was none.
+    pub fn delete_stored_file(&self, name: &str) -> Result<bool, Error> {
+        self.with(|c| {
+            Ok(c.execute("DELETE FROM stored_files WHERE name = $1", &[name.into()])? > 0)
+        })
+    }
+
+    /// The description of a job, if it is running as this attempt on
+    /// this worker.
+    pub fn held_job_description(
+        &self,
+        job_id: i64,
+        worker_id: i64,
+        attempt: i64,
+    ) -> Result<Option<String>, Error> {
+        self.with(|c| {
+            c.query(
+                "SELECT description FROM jobs
+                 WHERE id = $1 AND state = 'running' AND attempt = $2 AND worker_id = $3",
+                &[job_id.into(), attempt.into(), worker_id.into()],
+            )?
+            .first()
+            .map(|row| row.text(0).map(str::to_string))
+            .transpose()
+        })
     }
 
     pub fn create_admin_token(&self, name: &str, token_hash: &str) -> Result<i64, Error> {

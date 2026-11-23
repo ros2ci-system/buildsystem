@@ -14,6 +14,7 @@ path = "src/main.rs"
 ci_http = { path = "../http" }
 ci_json = { path = "../json" }
 ci_net = { path = "../net" }
+ci_tar = { path = "../tar" }
 
 [lints]
 workspace = true

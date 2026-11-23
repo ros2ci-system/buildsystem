@@ -29,6 +29,18 @@ Commands:
       service its own, so that the coordinator's log says who did what.
   revoke-admin-token <token-id>
       Revokes an admin token.
+  store-file <name> <file>
+      Stores a file on the coordinator under a name, replacing any earlier
+      one. A job reads it by naming it as stored:<name>, and only the
+      worker running such a job can download it.
+  store-context <name> <directory>
+      Packs a directory into a build context and stores it under a name.
+      The same directory contents always make the same context, so an
+      unchanged image definition is not rebuilt.
+  list-files
+      Lists the stored files.
+  delete-file <name>
+      Deletes a stored file.
   submit --pool <pool> --os <os> --arch <arch> --job <file> [--wait]
       Queues a job from a job description file and prints its id. With
       --wait, follows the job's log until it finishes; the exit status is
@@ -96,6 +108,42 @@ impl Admin {
                 .and_then(Value::as_str)
                 .unwrap_or("no reason given");
             return Err(format!("the coordinator answered {status}: {reason}"));
+        }
+        Ok(value)
+    }
+
+    /// Stores a file on the coordinator under a name.
+    fn store(&self, name: &str, path: &std::path::Path) -> Result<Value, String> {
+        let mut file =
+            fs::File::open(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let size = file.metadata().map_err(|e| e.to_string())?.len();
+        let url = self.base.with_target(&format!(
+            "/admin/v1/files/{}",
+            ci_http::percent_encode(name)
+        ));
+        let host = url.host_header();
+        let request = Request::new("PUT", &url.target, &host)
+            .header("Authorization", &self.authorization)
+            .header("Content-Type", "application/octet-stream")
+            .body(Body::Sized(&mut file, size));
+        let mut response = Connector::plain_only().send(&url, request).map_err(|e| {
+            format!(
+                "cannot reach the coordinator's admin API at {}: {e}",
+                self.base.host_header()
+            )
+        })?;
+        let bytes = response.body_bytes(1 << 20).map_err(|e| e.to_string())?;
+        let value = ci_json::parse_bytes(&bytes)
+            .map_err(|e| format!("the coordinator's reply was not JSON: {e}"))?;
+        if response.status != 200 {
+            let reason = value
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("no reason given");
+            return Err(format!(
+                "the coordinator answered {}: {reason}",
+                response.status
+            ));
         }
         Ok(value)
     }
@@ -294,6 +342,64 @@ fn run(admin: &Admin, command: &str, args: &[String]) -> Result<ExitCode, String
             eprintln!("token {id} revoked");
             Ok(ExitCode::SUCCESS)
         }
+        "store-file" | "store-context" => {
+            let (options, positional) = parse_args(args, &[])?;
+            only_options(&options, &[])?;
+            let [name, path] = positional.as_slice() else {
+                return Err(format!("{command} takes a name and a path"));
+            };
+            let reply = if command == "store-file" {
+                admin.store(name, std::path::Path::new(path))?
+            } else {
+                // Packed to a temporary file beside nothing of value, and
+                // removed whether or not the upload works.
+                let packed = std::env::temp_dir()
+                    .join(format!("ci-admin-context-{}.tar", std::process::id()));
+                let result = pack_context(std::path::Path::new(path), &packed)
+                    .and_then(|()| admin.store(name, &packed));
+                let _ = fs::remove_file(&packed);
+                result?
+            };
+            // The hash identifies the contents; for a build context it
+            // decides whether an image has to be rebuilt.
+            println!(
+                "{} {}",
+                reply.get("sha256").and_then(Value::as_str).unwrap_or("?"),
+                reply.get("name").and_then(Value::as_str).unwrap_or(name)
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        "list-files" => {
+            let (options, positional) = parse_args(args, &[])?;
+            only_options(&options, &[])?;
+            if !positional.is_empty() {
+                return Err(format!("unexpected argument {:?}", positional[0]));
+            }
+            let reply = admin.json("GET", "/admin/v1/files", None)?;
+            for file in reply.get("files").and_then(Value::as_array).unwrap_or(&[]) {
+                println!(
+                    "{} {:>12} {}",
+                    file.get("sha256").and_then(Value::as_str).unwrap_or("?"),
+                    file.get("size").and_then(Value::as_i64).unwrap_or(0),
+                    file.get("name").and_then(Value::as_str).unwrap_or("?")
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        "delete-file" => {
+            let (options, positional) = parse_args(args, &[])?;
+            only_options(&options, &[])?;
+            let [name] = positional.as_slice() else {
+                return Err("delete-file takes a name".to_string());
+            };
+            admin.json(
+                "DELETE",
+                &format!("/admin/v1/files/{}", ci_http::percent_encode(name)),
+                None,
+            )?;
+            eprintln!("{name} deleted");
+            Ok(ExitCode::SUCCESS)
+        }
         "submit" => {
             let (options, positional) = parse_args(args, &["wait"])?;
             only_options(&options, &["pool", "os", "arch", "job", "wait"])?;
@@ -380,6 +486,26 @@ fn run(admin: &Admin, command: &str, args: &[String]) -> Result<ExitCode, String
     }
 }
 
+/// Packs a directory into a tar archive for use as a build context.
+/// Files are added in name order with fixed timestamps, so the archive,
+/// and therefore its hash, depends only on the directory's contents.
+fn pack_context(directory: &std::path::Path, output: &std::path::Path) -> Result<(), String> {
+    if !directory.is_dir() {
+        return Err(format!("{} is not a directory", directory.display()));
+    }
+    let file =
+        fs::File::create(output).map_err(|e| format!("cannot create {}: {e}", output.display()))?;
+    let mut builder = ci_tar::Builder::new(io::BufWriter::new(file));
+    builder
+        .append_tree(directory, "")
+        .map_err(|e| format!("packing {}: {e}", directory.display()))?;
+    builder
+        .finish()
+        .map_err(|e| e.to_string())?
+        .flush()
+        .map_err(|e| e.to_string())
+}
+
 /// Follows a job until it finishes, printing its log as it grows.
 fn wait(admin: &Admin, id: i64) -> Result<ExitCode, String> {
     let mut shown = 0u64;
@@ -444,6 +570,41 @@ mod tests {
         assert!(parse_args(&strings(&["--pool"]), &[]).is_err());
         assert!(only_options(&options, &["pool", "wait"]).is_ok());
         assert!(only_options(&options, &["pool"]).is_err());
+    }
+
+    #[test]
+    fn packing_a_context_depends_only_on_contents() {
+        let base = std::env::temp_dir().join(format!("ci_admin_pack_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let make = |name: &str, order: &[(&str, &str)]| {
+            let dir = base.join(name);
+            for (path, contents) in order {
+                let file = dir.join(path);
+                fs::create_dir_all(file.parent().unwrap()).unwrap();
+                fs::write(file, contents).unwrap();
+            }
+            let out = base.join(format!("{name}.tar"));
+            pack_context(&dir, &out).unwrap();
+            fs::read(out).unwrap()
+        };
+        // The same files, created in a different order, at different times.
+        let first = make(
+            "one",
+            &[("Dockerfile", "FROM x\n"), ("scripts/run.sh", "echo\n")],
+        );
+        std::thread::sleep(Duration::from_millis(1100));
+        let second = make(
+            "two",
+            &[("scripts/run.sh", "echo\n"), ("Dockerfile", "FROM x\n")],
+        );
+        assert_eq!(first, second);
+        let changed = make(
+            "three",
+            &[("Dockerfile", "FROM y\n"), ("scripts/run.sh", "echo\n")],
+        );
+        assert_ne!(first, changed);
+        assert!(pack_context(&base.join("missing"), &base.join("x.tar")).is_err());
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

@@ -105,13 +105,66 @@ work directory.
 }
 ```
 
+### Images
+
+A job names its image in one of two ways.
+
+A **reference** is something a registry can supply:
+
+```json
+"image": "registry.example/core@sha256:0123..."
+```
+
+A **build definition** is the recipe itself: a build context (a tar archive
+holding the build file and what it copies in) and the build file's path in it.
+
+```json
+"image": {"build": {"context": "stored:ubuntu-noble.tar", "build_file": "Dockerfile"}}
+```
+
+A worker that has not built that recipe yet builds it and keeps the result, so
+no registry is needed. The image is kept under a name made from the context's
+hash, the build file's path and a `generation` number, so the same recipe is
+built once per worker and a changed recipe is a new image. Raising
+`generation` forces a rebuild of an unchanged recipe.
+
+An **image build job** builds the image and does nothing else:
+
+```json
+{
+  "kind": "image_build",
+  "image": {"build": {"context": "stored:ubuntu-noble.tar", "build_file": "Dockerfile"}},
+  "timeout_seconds": 3600
+}
+```
+
+If the build file fails, an image build job is a build failure. A job that
+only needed the image to run in counts it as an infrastructure failure and is
+retried.
+
+### Stored files
+
+An administrator can store files on the coordinator, and jobs read them as
+`stored:<name>`, as an input or as a build context:
+
+```
+ci-admin store-context ubuntu-noble.tar images/ubuntu-noble
+ci-admin store-file license.dat /path/to/license.dat
+```
+
+Only the worker running a job that names a stored file can download it, and
+only while it runs that job. That is what keeps a private file, such as a
+license, to the jobs it was given to. A job reads whatever is stored when it
+runs, so replacing a file takes effect at once.
+
 ### The contract between the agent and a job
 
 - **Job directory.** `/job` on Linux and `C:\job` on Windows, also given in the
   `CI_JOB_DIR` environment variable.
 - **Parameters.** `params.json` in the job directory.
 - **Inputs.** Files in the `in` subdirectory. The agent downloads them from
-  `http://` or `https://` URLs. `file://` URLs are accepted only by `run-job`.
+  `http://` or `https://` URLs, or from the coordinator for `stored:` names.
+  `file://` URLs are accepted only by `run-job`.
 - **Outputs.** Whatever the job writes to the `out` subdirectory is copied out
   when it finishes, whether it passed or failed.
 - **Exit code.** Zero is success. 75 means an infrastructure problem that was

@@ -228,7 +228,15 @@ impl Worker {
         let result = match JobDescription::parse(&job.description.to_json()) {
             Ok(description) => run::run_job(
                 &self.runtime,
-                &self.connector,
+                &run::Fetcher {
+                    connector: &self.connector,
+                    stored: Some(run::StoredAccess {
+                        coordinator: &self.coordinator,
+                        token: &session.token,
+                        job_id: job.job_id,
+                        attempt: job.attempt,
+                    }),
+                },
                 &description,
                 &job_dir,
                 Some(identity),

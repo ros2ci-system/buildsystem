@@ -25,6 +25,7 @@ dependencies = [
  "ci_http",
  "ci_json",
  "ci_net",
+ "ci_tar",
 ]
 
 [[package]]
@@ -72,6 +73,7 @@ dependencies = [
 name = "ci_e2e"
 version = "0.1.0"
 dependencies = [
+ "ci_container",
  "ci_http",
  "ci_json",
  "ci_postgres",
@@ -104,6 +106,7 @@ dependencies = [
 name = "ci_protocol"
 version = "0.1.0"
 dependencies = [
+ "ci_crypto",
  "ci_json",
 ]
 
