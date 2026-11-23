@@ -36,7 +36,10 @@ const DELIVERY_PATIENCE: Duration = Duration::from_secs(3600);
 
 pub struct Worker {
     pub coordinator: Url,
+    /// For talking to the coordinator.
     pub connector: Connector,
+    /// For downloading job inputs from other servers.
+    pub downloads: Connector,
     pub enrolment_token: String,
     pub runtime: Client,
     pub work_dir: PathBuf,
@@ -230,6 +233,7 @@ impl Worker {
                 &self.runtime,
                 &run::Fetcher {
                     connector: &self.connector,
+                    downloads: &self.downloads,
                     stored: Some(run::StoredAccess {
                         coordinator: &self.coordinator,
                         token: &session.token,

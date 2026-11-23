@@ -11,6 +11,10 @@ ci_http = { path = "../http" }
 # The one third-party dependency the project allows. It uses ring for its
 # cryptography, which builds with only a C compiler on Linux and Windows.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# The certificate authorities that public web sites use, as data. It comes
+# from the rustls project and has no code of its own. Needed to download
+# job inputs from public HTTPS servers, on Windows as well as Linux.
+webpki-roots = "1"
 
 [lints]
 workspace = true

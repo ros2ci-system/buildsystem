@@ -133,7 +133,10 @@ impl Drop for ContainerGuard<'_> {
 
 /// How the agent fetches the files a job names.
 pub struct Fetcher<'a> {
+    /// For the coordinator, which stored files come from.
     pub connector: &'a Connector,
+    /// For every other server.
+    pub downloads: &'a Connector,
     /// Needed for files stored on the coordinator. A job run by hand has
     /// no coordinator and cannot read them.
     pub stored: Option<StoredAccess<'a>>,
@@ -662,12 +665,13 @@ fn fetch(
     path: &Path,
     monitor: &mut dyn FnMut() -> Control,
 ) -> Result<bool, String> {
-    let (url, authorization, what) = match source {
+    let (connector, url, authorization, what) = match source {
         Source::LocalFile(local) => {
             fs::copy(local, path).map_err(|e| format!("{}: {e}", local.display()))?;
             return Ok(false);
         }
         Source::Url(url) => (
+            fetcher.downloads,
             Url::parse(url).map_err(|e| e.to_string())?,
             None,
             url.clone(),
@@ -680,6 +684,7 @@ fn fetch(
             // The session token goes to the coordinator and nowhere else:
             // this URL is built from the coordinator's own address.
             (
+                fetcher.connector,
                 access.coordinator.with_target(&stored_file_path(
                     access.job_id,
                     access.attempt,
@@ -695,8 +700,7 @@ fn fetch(
     if let Some(value) = &authorization {
         request = request.header("Authorization", value);
     }
-    let mut response = fetcher
-        .connector
+    let mut response = connector
         .send(&url, request)
         .map_err(|e| format!("downloading {what}: {e}"))?;
     if response.status != 200 {

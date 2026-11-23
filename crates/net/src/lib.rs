@@ -226,6 +226,29 @@ impl Connector {
         })
     }
 
+    /// A connector that trusts the certificate authorities public web
+    /// sites use, and also those in a PEM file if one is given. For
+    /// downloading from servers the system does not run itself.
+    pub fn with_public_roots(extra_ca_file: Option<&Path>) -> Result<Connector, Error> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        if let Some(path) = extra_ca_file {
+            for certificate in read_certificates(path)? {
+                roots
+                    .add(certificate)
+                    .map_err(|e| Error::Tls(format!("{}: {e}", path.display())))?;
+            }
+        }
+        let config = rustls::ClientConfig::builder_with_provider(provider())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| Error::Tls(e.to_string()))?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        Ok(Connector {
+            tls: Some(Arc::new(config)),
+        })
+    }
+
     pub fn connect(&self, url: &Url) -> Result<Stream, Error> {
         let mut last_error = None;
         let mut socket = None;

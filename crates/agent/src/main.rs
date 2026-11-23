@@ -132,9 +132,15 @@ fn work_command(args: &[String]) -> Result<(), String> {
             ci_net::Connector::plain_only()
         }
     };
+    // Job inputs come from public servers, whose certificates the usual
+    // public authorities vouch for. The coordinator is trusted only
+    // through the file given for it.
+    let downloads =
+        ci_net::Connector::with_public_roots(ca_file.as_deref()).map_err(|e| e.to_string())?;
     worker::Worker {
         coordinator,
         connector,
+        downloads,
         enrolment_token,
         runtime: runtime_client(runtime)?,
         work_dir: work_dir.ok_or("--work-dir is required")?,
@@ -174,6 +180,7 @@ fn run_job_command(args: &[String]) -> Result<ExitCode, String> {
         &client,
         &run::Fetcher {
             connector: &ci_net::Connector::plain_only(),
+            downloads: &ci_net::Connector::with_public_roots(None).map_err(|e| e.to_string())?,
             stored: None,
         },
         &job,

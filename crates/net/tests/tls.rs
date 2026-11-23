@@ -108,3 +108,22 @@ fn bad_certificate_files_are_reported() {
     assert!(Acceptor::from_pem_files(&fixture("server.pem"), &fixture("ca.pem")).is_err());
     assert!(Acceptor::from_pem_files(&fixture("server.key"), &fixture("server.key")).is_err());
 }
+
+#[test]
+fn public_roots_do_not_trust_a_private_authority_unless_it_is_added() {
+    let port = start_server();
+    let url = Url::parse(&format!("https://localhost:{port}/hello")).unwrap();
+    // The test server's certificate is signed by an authority no public
+    // root vouches for.
+    let public = Connector::with_public_roots(None).unwrap();
+    assert!(public
+        .send(&url, ci_http::Request::new("GET", "/hello", "localhost"))
+        .is_err());
+    // Adding that authority makes it trusted, alongside the public ones.
+    let both = Connector::with_public_roots(Some(&fixture("ca.pem"))).unwrap();
+    let response = both
+        .send(&url, ci_http::Request::new("GET", "/hello", "localhost"))
+        .unwrap();
+    assert_eq!(response.status, 200);
+    assert!(Connector::with_public_roots(Some(&fixture("missing.pem"))).is_err());
+}
