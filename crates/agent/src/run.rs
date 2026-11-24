@@ -344,6 +344,11 @@ fn run_in_container(
         // Windows 11 defaults to Hyper-V isolation, which needs nested
         // virtualization on a virtual machine. Process isolation does not.
         isolation: windows.then(|| "process".to_string()),
+        // Windows containers have no /dev/shm to size.
+        shm_size: job
+            .shared_memory_mb
+            .filter(|_| !windows)
+            .map(|mb| mb * 1024 * 1024),
         labels: owner
             .map(|owner| vec![(OWNER_LABEL.to_string(), owner.to_string())])
             .unwrap_or_default(),

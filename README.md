@@ -107,9 +107,16 @@ work directory.
   "environment": {"NAME": "value"},
   "parameters": {"anything": "the job needs"},
   "inputs": [{"name": "hello.txt", "url": "https://example.com/hello.txt"}],
-  "timeout_seconds": 600
+  "timeout_seconds": 600,
+  "shared_memory_mb": 2048
 }
 ```
+
+`shared_memory_mb` is optional. It is the size of `/dev/shm` in a Linux
+container, which is 64 MiB without it. That is too little for some of what
+gets tested: shared-memory transports, and tracing buffers, which are per
+CPU and so grow with the worker. Windows containers have no `/dev/shm`, and
+the member is ignored there.
 
 ### Images
 

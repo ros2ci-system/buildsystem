@@ -25,6 +25,9 @@ pub const STORED_PREFIX: &str = "stored:";
 /// How long an image build may take when the job does not say.
 const DEFAULT_BUILD_TIMEOUT: Duration = Duration::from_secs(2 * 3600);
 
+/// The largest shared memory size a job may ask for: 1 TiB.
+const MAX_SHARED_MEMORY_MB: u64 = 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct JobDescription {
     pub kind: JobKind,
@@ -36,6 +39,10 @@ pub struct JobDescription {
     pub parameters: Value,
     pub inputs: Vec<Input>,
     pub timeout: Duration,
+    /// The size of the container's shared memory file system, `/dev/shm`,
+    /// in MiB. Without it the container runtime's default applies, which
+    /// is 64 MiB. Linux containers only.
+    pub shared_memory_mb: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +189,7 @@ impl JobDescription {
                 "parameters",
                 "inputs",
                 "timeout_seconds",
+                "shared_memory_mb",
             ]
             .contains(&key.as_str())
             {
@@ -273,6 +281,21 @@ impl JobDescription {
             _ => return Err("\"timeout_seconds\" must be a positive whole number".to_string()),
         };
 
+        let shared_memory_mb = match doc.get("shared_memory_mb") {
+            None => None,
+            Some(value) => match value.as_u64() {
+                Some(mb) if (1..=MAX_SHARED_MEMORY_MB).contains(&mb) => Some(mb),
+                _ => {
+                    return Err(format!(
+                    "\"shared_memory_mb\" must be a whole number from 1 to {MAX_SHARED_MEMORY_MB}"
+                ))
+                }
+            },
+        };
+        if kind == JobKind::ImageBuild && shared_memory_mb.is_some() {
+            return Err("an image build job runs no container to size".to_string());
+        }
+
         Ok(JobDescription {
             kind,
             image,
@@ -281,6 +304,7 @@ impl JobDescription {
             parameters,
             inputs,
             timeout,
+            shared_memory_mb,
         })
     }
 }
@@ -401,6 +425,7 @@ mod tests {
         assert_eq!(job.parameters, Value::Object(vec![]));
         assert!(job.inputs.is_empty());
         assert_eq!(job.timeout, Duration::from_secs(60));
+        assert_eq!(job.shared_memory_mb, None);
     }
 
     #[test]
@@ -413,10 +438,12 @@ mod tests {
                 "environment": {"A": "1", "B": "two words"},
                 "parameters": {"distribution": "rolling", "repos": [1, 2]},
                 "inputs": [{"name": "src.tar", "url": "file:///tmp/src.tar"}],
-                "timeout_seconds": 7200
+                "timeout_seconds": 7200,
+                "shared_memory_mb": 2048
             }"#,
         )
         .unwrap();
+        assert_eq!(job.shared_memory_mb, Some(2048));
         assert_eq!(
             job.environment,
             [("A".into(), "1".into()), ("B".into(), "two words".into())]
@@ -459,6 +486,9 @@ mod tests {
             r#"{"image": "a", "command": ["true"], "timeout_seconds": 0}"#,
             r#"{"image": "a", "command": ["true"], "timeout_seconds": -5}"#,
             r#"{"image": "a", "command": ["true"], "timeout_seconds": 1.5}"#,
+            r#"{"image": "a", "command": ["true"], "timeout_seconds": 60, "shared_memory_mb": 0}"#,
+            r#"{"image": "a", "command": ["true"], "timeout_seconds": 60, "shared_memory_mb": "2g"}"#,
+            r#"{"image": "a", "command": ["true"], "timeout_seconds": 60, "shared_memory_mb": 99999999}"#,
             &with(r#""surprise": 1"#),
             &with(r#""kind": "deploy""#),
             &with(r#""kind": 3"#),

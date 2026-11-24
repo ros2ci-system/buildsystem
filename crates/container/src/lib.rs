@@ -194,6 +194,9 @@ pub struct ContainerSpec {
     pub working_dir: Option<String>,
     /// Windows only: `process` or `hyperv`.
     pub isolation: Option<String>,
+    /// Linux only: the size of `/dev/shm` in bytes. Without it the
+    /// runtime's default applies.
+    pub shm_size: Option<u64>,
     /// Labels to attach, so the containers can be found again later.
     pub labels: Vec<(String, String)>,
 }
@@ -550,11 +553,18 @@ impl Client {
                 ),
             ));
         }
+        let mut host = Vec::new();
         if let Some(isolation) = &spec.isolation {
-            members.push((
-                "HostConfig",
-                Value::object([("Isolation", Value::from(isolation.as_str()))]),
-            ));
+            host.push(("Isolation", Value::from(isolation.as_str())));
+        }
+        if let Some(bytes) = spec.shm_size {
+            let bytes = i64::try_from(bytes).map_err(|_| {
+                Error::InvalidArgument("the shared memory size is too large".to_string())
+            })?;
+            host.push(("ShmSize", Value::Int(bytes)));
+        }
+        if !host.is_empty() {
+            members.push(("HostConfig", Value::object(host)));
         }
         let body = Value::object(members).to_json();
         let reply = self.json("POST", "/containers/create", Some(&body))?;

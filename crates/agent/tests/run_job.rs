@@ -289,6 +289,32 @@ fn job_past_its_timeout_is_killed() {
     assert!(result.log().contains("started"));
 }
 
+/// A Linux container gets the 64 MiB of shared memory the runtime gives by
+/// default, or the size the job asks for.
+#[cfg(not(windows))]
+#[test]
+fn shared_memory_is_the_size_the_job_asks_for() {
+    let Some(runtime) = runtime() else { return };
+    let script = "df -m /dev/shm | tail -1";
+    let size = |log: &str| -> u64 {
+        let line = log.lines().rev().find(|l| l.contains("/dev/shm")).unwrap();
+        line.split_whitespace().nth(1).unwrap().parse().unwrap()
+    };
+
+    let plain = run(
+        &runtime,
+        "shm_default",
+        &shell_job(&image(), script, 120, &[]),
+    );
+    assert_eq!(plain.outcome(), "success", "{}", plain.message());
+    assert!(size(&plain.log()) <= 64, "{}", plain.log());
+
+    let job = shell_job(&image(), script, 120, &[]).replacen('{', "{\"shared_memory_mb\": 300,", 1);
+    let sized = run(&runtime, "shm_sized", &job);
+    assert_eq!(sized.outcome(), "success", "{}", sized.message());
+    assert_eq!(size(&sized.log()), 300, "{}", sized.log());
+}
+
 #[test]
 fn missing_image_is_an_infrastructure_failure() {
     let Some(runtime) = runtime() else { return };
