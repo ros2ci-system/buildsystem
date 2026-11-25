@@ -58,6 +58,8 @@ ci-agent work --coordinator https://coordinator.example:8443 \
 ci-admin submit --pool release --os linux --arch amd64 --job job.json --wait
 ```
 
+To run all of this in containers, see [deploy/README.md](deploy/README.md).
+
 Without `--tls-cert` and `--tls-key` the worker API is plain HTTP, which is
 only for running everything on one machine.
 

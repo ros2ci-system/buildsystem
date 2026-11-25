@@ -1,0 +1,40 @@
+# Copyright 2026 The ros2ci authors
+# SPDX-License-Identifier: Apache-2.0
+
+# Images for running the system in containers. One build file, two images:
+#
+#   docker build -f deploy/Containerfile --target coordinator -t ros2ci-coordinator .
+#   docker build -f deploy/Containerfile --target agent -t ros2ci-agent .
+#
+# The build context is the top of this repository. deploy/compose.yaml
+# builds both. Podman works the same way.
+
+FROM docker.io/library/rust:1.99-slim-trixie AS build
+WORKDIR /src
+COPY . .
+RUN cargo build --release --locked -p ci_coordinator -p ci_admin -p ci_agent
+
+# The coordinator, with the admin tool beside it so that
+# "exec <container> ci-admin ..." works without installing anything.
+FROM docker.io/library/debian:trixie-slim AS coordinator
+RUN useradd --system --uid 10001 --home-dir /data --shell /usr/sbin/nologin ros2ci \
+    && install -d -o ros2ci -g ros2ci -m 0700 /data
+COPY --from=build /src/target/release/ci-coordinator /src/target/release/ci-admin /usr/local/bin/
+USER ros2ci
+# Inside the container the admin API has to listen on every address to be
+# reachable at all. Publish its port on the host's loopback address only.
+ENV CI_ADMIN_URL=http://127.0.0.1:8444 \
+    CI_ADMIN_TOKEN_FILE=/data/admin-token
+VOLUME /data
+EXPOSE 8443 8444
+ENTRYPOINT ["ci-coordinator"]
+CMD ["--data-dir", "/data", "--worker-listen", "0.0.0.0:8443", "--admin-listen", "0.0.0.0:8444"]
+
+# The agent. It starts job containers as siblings through the container
+# runtime's socket, which has to be mounted in. It runs as root inside
+# its container because that is who may use the socket: with rootless
+# Podman, root in the container is the user who owns the socket.
+FROM docker.io/library/debian:trixie-slim AS agent
+COPY --from=build /src/target/release/ci-agent /usr/local/bin/
+VOLUME /work
+ENTRYPOINT ["ci-agent"]

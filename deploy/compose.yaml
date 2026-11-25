@@ -1,0 +1,96 @@
+# Copyright 2026 The ros2ci authors
+# SPDX-License-Identifier: Apache-2.0
+
+# The smallest complete installation: PostgreSQL, the coordinator and one
+# worker, as three containers on one machine. See README.md beside this
+# file for the steps.
+
+services:
+  postgres:
+    image: docker.io/library/postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ros2ci
+      POSTGRES_DB: ros2ci
+      POSTGRES_PASSWORD: ${CI_POSTGRES_PASSWORD:?set CI_POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ros2ci -d ros2ci"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  coordinator:
+    build:
+      context: ..
+      dockerfile: deploy/Containerfile
+      target: coordinator
+    image: ros2ci-coordinator
+    restart: unless-stopped
+    # Neither program handles signals itself. An init process as PID 1
+    # passes them on, so that a stop takes effect at once.
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      CI_DATABASE_URL: postgres://ros2ci:${CI_POSTGRES_PASSWORD}@postgres:5432/ros2ci
+    command:
+      - --data-dir
+      - /data
+      - --worker-listen
+      - 0.0.0.0:8443
+      - --admin-listen
+      - 0.0.0.0:8444
+      - --tls-cert
+      - /certs/server.pem
+      - --tls-key
+      - /certs/server.key
+    ports:
+      # The worker API, for workers on other machines.
+      - "${CI_WORKER_BIND:-0.0.0.0}:${CI_WORKER_PORT:-8443}:8443"
+      # The admin API. Keep it on the loopback address.
+      - "127.0.0.1:${CI_ADMIN_PORT:-8444}:8444"
+    volumes:
+      - coordinator:/data
+      - ./certs/server.pem:/certs/server.pem:ro
+      - ./certs/server.key:/certs/server.key:ro
+
+  worker:
+    # Started in a second step, once it has a token: see README.md.
+    profiles: ["worker"]
+    build:
+      context: ..
+      dockerfile: deploy/Containerfile
+      target: agent
+    image: ros2ci-agent
+    restart: unless-stopped
+    init: true
+    depends_on:
+      - coordinator
+    command:
+      - work
+      - --coordinator
+      - https://coordinator:8443
+      - --token-file
+      - /run/ros2ci/worker-token
+      - --ca-file
+      - /run/ros2ci/ca.pem
+      - --work-dir
+      - /work
+      - --runtime
+      - unix:///run/ros2ci/runtime.sock
+    # The runtime's socket carries no label a confined container may use.
+    security_opt:
+      - label=disable
+    volumes:
+      - worker:/work
+      - ./secrets/worker-token:/run/ros2ci/worker-token:ro
+      - ./certs/ca.pem:/run/ros2ci/ca.pem:ro
+      - ${CI_RUNTIME_SOCKET:?set CI_RUNTIME_SOCKET in .env}:/run/ros2ci/runtime.sock
+
+volumes:
+  postgres:
+  coordinator:
+  worker:
