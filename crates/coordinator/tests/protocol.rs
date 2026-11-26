@@ -1791,3 +1791,207 @@ fn build_definitions_are_checked_at_submission() {
     // A run job with a build definition but no command.
     assert_eq!(submit(build_job("stored:context.tar", &[])), 400);
 }
+
+#[test]
+fn a_build_is_published_into_a_signed_repository() {
+    let key_path = std::env::temp_dir().join(format!("ros2ci-test-key-{}", std::process::id()));
+    let key =
+        ci_openpgp::SigningKey::generate("Test <test@example.invalid>", 1_795_000_000).unwrap();
+    fs::write(&key_path, key.to_file_text()).unwrap();
+    let repo_url = format!("http://127.0.0.1:{}", free_port());
+    let Some(c) = Coordinator::start(&[
+        "--signing-key",
+        key_path.to_str().unwrap(),
+        "--repo-listen",
+        repo_url.strip_prefix("http://").unwrap(),
+    ]) else {
+        return;
+    };
+    let fetch = |path: &str| c.call(&repo_url, "GET", path, None, None);
+
+    let repository = Value::object([
+        ("name", Value::from("test-apt")),
+        ("format", Value::from("apt")),
+        ("suite", Value::from("resolute")),
+        ("version_suffix", Value::from("resolute")),
+        ("architectures", Value::strings(["amd64"])),
+        ("source_arch", Value::from("amd64")),
+    ]);
+    let create = |body: &Value| {
+        c.admin("POST", "/admin/v1/repositories", Some(body.clone()))
+            .0
+    };
+    assert_eq!(create(&repository), 201);
+    assert_eq!(create(&repository), 409, "the name is taken");
+    // An empty repository is already signed and served.
+    let (status, release) = fetch("/test-apt/dists/resolute/InRelease");
+    assert_eq!(status, 200);
+    assert!(String::from_utf8_lossy(&release).contains("-----BEGIN PGP SIGNATURE-----"));
+    assert_eq!(
+        fetch("/test-apt/key.asc").1,
+        key.public_key_armored().into_bytes()
+    );
+
+    // The rebuild counter goes up by one each time it is asked for.
+    let next_revision = || {
+        let (status, reply) = c.admin(
+            "POST",
+            "/admin/v1/repositories/test-apt/revisions",
+            Some(Value::object([
+                ("package", Value::from("my_tool")),
+                ("version", Value::from("1.2.3")),
+            ])),
+        );
+        assert_eq!(status, 200, "{reply:?}");
+        reply.get("revision").unwrap().as_i64().unwrap()
+    };
+    assert_eq!(next_revision(), 1);
+    assert_eq!(next_revision(), 2);
+
+    // A job that builds one package and describes it.
+    let package = b"the bytes of a package";
+    let metadata = Value::object([
+        ("version", Value::Int(1)),
+        ("format", Value::from("deb")),
+        (
+            "packages",
+            Value::Array(vec![Value::object([
+                ("file", Value::from("packages/my-tool.deb")),
+                ("kind", Value::from("binary")),
+                (
+                    "fields",
+                    Value::Array(vec![
+                        Value::strings(["Package", "ros-rolling-my-tool"]),
+                        Value::strings(["Version", "1.2.3-2resolute"]),
+                        Value::strings(["Architecture", "amd64"]),
+                        Value::strings(["Filename", "somewhere/else.deb"]),
+                    ]),
+                ),
+            ])]),
+        ),
+    ])
+    .to_json();
+    let session = c.register("release", "linux", "amd64");
+    let job_id = c.submit("release", "linux", "amd64");
+    let job = c.claim(&session).unwrap();
+    let publish = |revision: i64, name: &str| {
+        c.admin(
+            "POST",
+            "/admin/v1/repositories/test-apt/publish",
+            Some(Value::object([
+                ("job_id", Value::Int(job_id)),
+                ("package", Value::from("my_tool")),
+                ("version", Value::from("1.2.3")),
+                ("revision", Value::Int(revision)),
+                ("names", Value::strings([name])),
+            ])),
+        )
+    };
+    assert_eq!(
+        publish(2, "ros-rolling-my-tool").0,
+        409,
+        "the job is still running"
+    );
+    let mut listed = Vec::new();
+    for (path, data) in [
+        ("packages/my-tool.deb", &package[..]),
+        ("repo-metadata.json", metadata.as_bytes()),
+    ] {
+        let target = format!("/worker/v1/jobs/{job_id}/attempts/1/artifacts/{path}");
+        assert_eq!(
+            c.call(&c.worker_url, "PUT", &target, Some(&session), Some(data))
+                .0,
+            200
+        );
+        listed.push(Value::object([
+            ("path", Value::from(path)),
+            ("size", Value::Int(data.len() as i64)),
+            ("sha256", Value::from(hex_encode(&sha256(data)))),
+        ]));
+    }
+    assert_eq!(c.finish(&session, job, "success", listed).0, 200);
+
+    // What the job built is published only as what it was asked to build.
+    assert_eq!(
+        publish(3, "ros-rolling-my-tool").0,
+        409,
+        "revision 3 was never handed out"
+    );
+    let (status, reply) = publish(2, "libc6");
+    assert_eq!(status, 400, "{reply:?}");
+    let (status, reply) = publish(1, "ros-rolling-my-tool");
+    assert_eq!(status, 400, "the package carries revision 2: {reply:?}");
+    assert_eq!(fetch("/test-apt/pool/amd64/my_tool/my-tool.deb").0, 404);
+
+    let (status, reply) = publish(2, "ros-rolling-my-tool");
+    assert_eq!(status, 200, "{reply:?}");
+    assert_eq!(
+        publish(2, "ros-rolling-my-tool").0,
+        200,
+        "the same build again changes nothing"
+    );
+
+    // The index names the file by the path and hash the coordinator
+    // gives it, and the top of the index names that index by its hash.
+    let (_, packages) = fetch("/test-apt/dists/resolute/main/binary-amd64/Packages");
+    let packages = String::from_utf8(packages).unwrap();
+    assert_eq!(
+        packages,
+        format!(
+            "Package: ros-rolling-my-tool\nVersion: 1.2.3-2resolute\nArchitecture: amd64\n\
+             Filename: pool/amd64/my_tool/my-tool.deb\nSize: {}\nSHA256: {}\n",
+            package.len(),
+            hex_encode(&sha256(package))
+        )
+    );
+    let (_, release) = fetch("/test-apt/dists/resolute/Release");
+    let index_hash = hex_encode(&sha256(packages.as_bytes()));
+    assert!(String::from_utf8(release).unwrap().contains(&format!(
+        " {index_hash} {} main/binary-amd64/Packages\n",
+        packages.len()
+    )));
+    assert_eq!(
+        fetch(&format!(
+            "/test-apt/dists/resolute/main/binary-amd64/by-hash/SHA256/{index_hash}"
+        ))
+        .1,
+        packages.as_bytes()
+    );
+    assert_eq!(fetch("/test-apt/pool/amd64/my_tool/my-tool.deb").1, package);
+
+    let (_, status) = c.admin("GET", "/admin/v1/repositories/test-apt", None);
+    let builds = status.get("builds").unwrap().as_array().unwrap();
+    assert_eq!(builds.len(), 1);
+    assert_eq!(builds[0].get("revision").unwrap().as_i64(), Some(2));
+    assert_eq!(builds[0].get("job_id").unwrap().as_i64(), Some(job_id));
+
+    // The listener serves the repositories and nothing else.
+    for path in [
+        "/admin-token",
+        "/test-apt/%2e%2e/%2e%2e/admin-token",
+        "/test-apt",
+        "/",
+    ] {
+        assert!(matches!(fetch(path).0, 400 | 404), "{path}");
+    }
+    let _ = fs::remove_file(&key_path);
+}
+
+#[test]
+fn nothing_is_published_without_a_signing_key() {
+    let Some(c) = Coordinator::start(&[]) else {
+        return;
+    };
+    let (status, reply) = c.admin(
+        "POST",
+        "/admin/v1/repositories",
+        Some(Value::object([
+            ("name", Value::from("test-rpm")),
+            ("format", Value::from("rpm")),
+            ("version_suffix", Value::from(".el10")),
+            ("architectures", Value::strings(["amd64"])),
+            ("source_arch", Value::from("amd64")),
+        ])),
+    );
+    assert_eq!(status, 409, "{reply:?}");
+}

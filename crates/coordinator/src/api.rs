@@ -26,6 +26,8 @@ use ci_protocol::{
 
 use crate::db::{self, Artifact, Db, Requeue, Worker};
 
+mod repositories;
+
 /// Largest JSON request body accepted. A Report carries a chunk of log,
 /// so this also bounds how much log one Report can deliver.
 const MAX_JSON_BODY: usize = 8 * 1024 * 1024;
@@ -49,6 +51,12 @@ pub struct Settings {
 pub struct Coordinator {
     pub db: Db,
     pub settings: Settings,
+    /// The key that signs repository indexes. Without one, nothing can
+    /// be published.
+    pub signing_key: Option<ci_openpgp::SigningKey>,
+    /// Held while a repository changes, so that two publishes cannot
+    /// write one index at the same time.
+    pub publishing: std::sync::Mutex<()>,
 }
 
 /// An error reply: a status and a message for the caller.
@@ -594,6 +602,14 @@ impl Coordinator {
             ("GET", ["admin", "v1", "jobs", id, "log"]) => self.job_log(job(id)?),
             ("GET", ["admin", "v1", "jobs", id, "artifacts", rest @ ..]) if !rest.is_empty() => {
                 self.job_artifact(job(id)?, &rest.join("/"))
+            }
+            ("POST", ["admin", "v1", "repositories"]) => self.create_repository(&admin, request),
+            ("GET", ["admin", "v1", "repositories", name]) => self.repository_status(name),
+            ("POST", ["admin", "v1", "repositories", name, "revisions"]) => {
+                self.allocate_revision(&admin, name, request)
+            }
+            ("POST", ["admin", "v1", "repositories", name, "publish"]) => {
+                self.publish(&admin, name, request)
             }
             _ => Err(reject(404, "not found")),
         }

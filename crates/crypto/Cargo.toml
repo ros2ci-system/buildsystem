@@ -1,6 +1,6 @@
 [package]
 name = "ci_crypto"
-description = "Hashing, random numbers and text encodings"
+description = "Hashing, signatures, random numbers and text encodings"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

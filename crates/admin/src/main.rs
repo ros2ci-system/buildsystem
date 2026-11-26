@@ -13,6 +13,7 @@ use std::time::Duration;
 use ci_http::{Body, Request};
 use ci_json::Value;
 use ci_net::{Connector, Url};
+use ci_openpgp::SigningKey;
 
 const USAGE: &str = "\
 Usage: ci-admin [--admin-url <url>] [--token-file <file>] <command>
@@ -61,6 +62,32 @@ Commands:
       Downloads one artifact of a job.
   cancel <job-id>
       Cancels a job.
+  generate-signing-key --user-id <text> --output <file>
+      Makes the key that signs repository indexes and writes it to a new
+      file that only you can read. It talks to no coordinator and needs
+      no token. The coordinator reads the file as --signing-key. The
+      user id says whose key it is, conventionally: Name <address>
+  create-repository --name <name> --format apt|rpm --version-suffix <text>
+                    --architectures <arch>[,<arch>] --source-arch <arch>
+                    [--suite <suite>]
+      Creates an empty, signed package repository. The version suffix
+      follows the rebuild counter in package versions: the release code
+      name for apt (resolute), the dist tag for RPM (.el10). Source
+      packages are taken from the builds of the source architecture. An
+      apt repository needs its suite.
+  repository <name>
+      Prints a repository's settings and what is published in it, as JSON.
+  repository-key <name>
+      Prints the public key that a repository's index is signed with.
+  next-revision --repository <name> --package <package> --version <version>
+      Hands out the rebuild counter for the next build of a version of a
+      package and prints it: 1 the first time, one more each time after.
+      Give it to the build as its revision.
+  publish --repository <name> --job <job-id> --package <package>
+          --version <version> --revision <n> --name <name> [--name <name>]
+      Publishes the packages a successful job built. Each --name is a
+      binary or source package name the build may publish; anything else
+      the job built, or a version other than the one stated, is refused.
 
   --admin-url <url>    The coordinator's admin API. Defaults to the
                        CI_ADMIN_URL environment variable, then to
@@ -244,6 +271,15 @@ fn main() -> ExitCode {
     if matches!(command.as_str(), "--help" | "-h" | "help") {
         print!("{USAGE}");
         return ExitCode::SUCCESS;
+    }
+    if command == "generate-signing-key" {
+        return match generate_signing_key(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("ci-admin: {message}");
+                ExitCode::from(3)
+            }
+        };
     }
     let result = Url::parse(&admin_url)
         .map_err(|e| e.to_string())
@@ -536,8 +572,171 @@ fn run(admin: &Admin, command: &str, args: &[String]) -> Result<ExitCode, String
                 .map_err(|e| format!("downloading to {output}: {e}"))?;
             Ok(ExitCode::SUCCESS)
         }
+        "create-repository" => {
+            let (options, positional) = parse_args(args, &[])?;
+            only_options(
+                &options,
+                &[
+                    "name",
+                    "format",
+                    "version-suffix",
+                    "architectures",
+                    "source-arch",
+                    "suite",
+                ],
+            )?;
+            if !positional.is_empty() {
+                return Err(format!("unexpected argument {:?}", positional[0]));
+            }
+            let mut body = vec![
+                ("name", Value::from(option(&options, "name")?)),
+                ("format", Value::from(option(&options, "format")?)),
+                (
+                    "version_suffix",
+                    Value::from(option(&options, "version-suffix")?),
+                ),
+                (
+                    "architectures",
+                    Value::strings(option(&options, "architectures")?.split(',')),
+                ),
+                ("source_arch", Value::from(option(&options, "source-arch")?)),
+            ];
+            if let Ok(suite) = option(&options, "suite") {
+                body.push(("suite", Value::from(suite)));
+            }
+            admin.json("POST", "/admin/v1/repositories", Some(&Value::object(body)))?;
+            Ok(ExitCode::SUCCESS)
+        }
+        "repository" | "repository-key" => {
+            let (options, positional) = parse_args(args, &[])?;
+            only_options(&options, &[])?;
+            let name = positional.first().ok_or("a repository name is required")?;
+            let status = admin.json(
+                "GET",
+                &format!("/admin/v1/repositories/{}", ci_http::percent_encode(name)),
+                None,
+            )?;
+            if command == "repository" {
+                print!("{}", status.to_json_pretty());
+            } else {
+                print!(
+                    "{}",
+                    status
+                        .get("public_key")
+                        .and_then(Value::as_str)
+                        .ok_or("the coordinator has no signing key")?
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        "next-revision" => {
+            let (options, positional) = parse_args(args, &[])?;
+            only_options(&options, &["repository", "package", "version"])?;
+            if !positional.is_empty() {
+                return Err(format!("unexpected argument {:?}", positional[0]));
+            }
+            let reply = admin.json(
+                "POST",
+                &format!(
+                    "/admin/v1/repositories/{}/revisions",
+                    ci_http::percent_encode(option(&options, "repository")?)
+                ),
+                Some(&Value::object([
+                    ("package", Value::from(option(&options, "package")?)),
+                    ("version", Value::from(option(&options, "version")?)),
+                ])),
+            )?;
+            println!(
+                "{}",
+                reply
+                    .get("revision")
+                    .and_then(Value::as_i64)
+                    .ok_or("the reply held no revision")?
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        "publish" => {
+            let (options, positional) = parse_args(args, &[])?;
+            only_options(
+                &options,
+                &[
+                    "repository",
+                    "job",
+                    "package",
+                    "version",
+                    "revision",
+                    "name",
+                ],
+            )?;
+            if !positional.is_empty() {
+                return Err(format!("unexpected argument {:?}", positional[0]));
+            }
+            let number = |name: &str| -> Result<i64, String> {
+                option(&options, name)?
+                    .parse()
+                    .map_err(|_| format!("--{name} needs a whole number"))
+            };
+            let names = options
+                .iter()
+                .filter(|(name, _)| name == "name")
+                .map(|(_, value)| value.as_str());
+            let reply = admin.json(
+                "POST",
+                &format!(
+                    "/admin/v1/repositories/{}/publish",
+                    ci_http::percent_encode(option(&options, "repository")?)
+                ),
+                Some(&Value::object([
+                    ("job_id", Value::Int(number("job")?)),
+                    ("package", Value::from(option(&options, "package")?)),
+                    ("version", Value::from(option(&options, "version")?)),
+                    ("revision", Value::Int(number("revision")?)),
+                    ("names", Value::strings(names)),
+                ])),
+            )?;
+            for file in reply
+                .get("files")
+                .and_then(Value::as_array)
+                .unwrap_or_default()
+            {
+                println!("{}", file.as_str().unwrap_or_default());
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         other => Err(format!("unknown command {other:?}; see ci-admin --help")),
     }
+}
+
+/// Makes a signing key and writes it to a new private file.
+fn generate_signing_key(args: &[String]) -> Result<(), String> {
+    let (options, positional) = parse_args(args, &[])?;
+    only_options(&options, &["user-id", "output"])?;
+    if !positional.is_empty() {
+        return Err(format!("unexpected argument {:?}", positional[0]));
+    }
+    let output = option(&options, "output")?;
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs() as u32;
+    let key = SigningKey::generate(option(&options, "user-id")?, created)?;
+    // Never over an existing file: replacing a key that repositories
+    // are signed with would lock their users out.
+    let mut open = fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open.mode(0o600);
+    }
+    let mut file = open
+        .open(output)
+        .map_err(|e| format!("cannot create {output}: {e}"))?;
+    file.write_all(key.to_file_text().as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|e| format!("cannot write {output}: {e}"))?;
+    println!("{}", key.fingerprint_hex());
+    Ok(())
 }
 
 /// Packs a directory into a tar archive for use as a build context.

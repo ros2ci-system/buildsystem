@@ -342,11 +342,24 @@ pub struct ContainerState {
 #[derive(Debug, Clone)]
 pub struct Client {
     endpoint: Endpoint,
+    network: Option<String>,
 }
 
 impl Client {
     pub fn new(endpoint: Endpoint) -> Client {
-        Client { endpoint }
+        Client {
+            endpoint,
+            network: None,
+        }
+    }
+
+    /// Makes every container this client creates join the named network
+    /// of the runtime, instead of the runtime's default. `host` shares
+    /// the machine's own network.
+    pub fn with_network(mut self, network: &str) -> Result<Client, Error> {
+        check_label(network)?;
+        self.network = Some(network.to_string());
+        Ok(self)
     }
 
     /// The runtime's version information. Also the cheapest way to check
@@ -562,6 +575,9 @@ impl Client {
                 Error::InvalidArgument("the shared memory size is too large".to_string())
             })?;
             host.push(("ShmSize", Value::Int(bytes)));
+        }
+        if let Some(network) = &self.network {
+            host.push(("NetworkMode", Value::from(network.as_str())));
         }
         if !host.is_empty() {
             members.push(("HostConfig", Value::object(host)));

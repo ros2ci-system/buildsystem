@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/crypto",
+    "crates/openpgp",
     "crates/json",
     "crates/tar",
     "crates/http",

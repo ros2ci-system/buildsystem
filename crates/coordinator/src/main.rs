@@ -10,6 +10,7 @@
 
 mod api;
 mod db;
+mod repo;
 
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -38,6 +39,13 @@ option, so that the password does not show in the process list.
   --tls-cert <file>          Certificate chain for the worker API, in PEM.
   --tls-key <file>           Its private key, in PEM. Without these two the
                              worker API is plain HTTP, for local use only.
+  --repo-listen <addr>       Address to serve the package repositories on,
+                             read-only, over plain HTTP. Their indexes are
+                             signed, which is what clients check. Not
+                             served unless given.
+  --signing-key <file>       The key that signs repository indexes, as
+                             the ci-admin generate-signing-key command writes it.
+                             Without it nothing can be published.
   --lease-seconds <n>        How long a job stays claimed without a Report.
                              Default 60.
   --report-interval-seconds <n>
@@ -57,6 +65,8 @@ struct Options {
     admin_listen: String,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
+    repo_listen: Option<String>,
+    signing_key: Option<PathBuf>,
     settings_numbers: [i64; 5],
 }
 
@@ -66,6 +76,8 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
     let mut admin_listen = "127.0.0.1:8444".to_string();
     let mut tls_cert = None;
     let mut tls_key = None;
+    let mut repo_listen = None;
+    let mut signing_key = None;
     // lease, report interval, claim interval, max failures, backoff
     let mut numbers = [60i64, 10, 3, 3, 30];
     let mut iter = args.iter();
@@ -87,6 +99,8 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
             "--admin-listen" => admin_listen = value()?,
             "--tls-cert" => tls_cert = Some(PathBuf::from(value()?)),
             "--tls-key" => tls_key = Some(PathBuf::from(value()?)),
+            "--repo-listen" => repo_listen = Some(value()?),
+            "--signing-key" => signing_key = Some(PathBuf::from(value()?)),
             "--lease-seconds" => numbers[0] = number(value()?)?,
             "--report-interval-seconds" => numbers[1] = number(value()?)?,
             "--claim-interval-seconds" => numbers[2] = number(value()?)?,
@@ -107,6 +121,8 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
         admin_listen,
         tls_cert,
         tls_key,
+        repo_listen,
+        signing_key,
         settings_numbers: numbers,
     })
 }
@@ -141,8 +157,26 @@ fn run(args: &[String]) -> Result<(), String> {
         _ => None,
     };
 
+    let signing_key = match &options.signing_key {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+            let key = ci_openpgp::SigningKey::from_file_text(&text)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            eprintln!(
+                "repository indexes are signed by {} ({})",
+                key.fingerprint_hex(),
+                key.user_id()
+            );
+            Some(key)
+        }
+        None => None,
+    };
+
     let [lease, report, claim, max_failures, backoff] = options.settings_numbers;
     let coordinator = Arc::new(Coordinator {
+        signing_key,
+        publishing: std::sync::Mutex::new(()),
         db: db::Db::open(database)?,
         settings: Settings {
             data_dir: options.data_dir.clone(),
@@ -203,6 +237,23 @@ fn run(args: &[String]) -> Result<(), String> {
                 4,
                 |socket| Ok(Stream::Plain(socket)),
                 move |request| coordinator.handle_admin(request),
+            )
+        });
+    }
+    if let Some(address) = &options.repo_listen {
+        let listener =
+            TcpListener::bind(address).map_err(|e| format!("cannot listen on {address}: {e}"))?;
+        eprintln!(
+            "package repositories on {} (plain HTTP, read-only)",
+            listener.local_addr().map_err(|e| e.to_string())?
+        );
+        let coordinator = Arc::clone(&coordinator);
+        thread::spawn(move || {
+            ci_http::server::serve(
+                listener,
+                16,
+                |socket| Ok(Stream::Plain(socket)),
+                move |request| coordinator.handle_repository(request),
             )
         });
     }

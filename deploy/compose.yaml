@@ -47,15 +47,24 @@ services:
       - /certs/server.pem
       - --tls-key
       - /certs/server.key
+      - --repo-listen
+      - 0.0.0.0:8445
+      - --signing-key
+      - /run/ros2ci/signing-key
     ports:
       # The worker API, for workers on other machines.
       - "${CI_WORKER_BIND:-0.0.0.0}:${CI_WORKER_PORT:-8443}:8443"
       # The admin API. Keep it on the loopback address.
       - "127.0.0.1:${CI_ADMIN_PORT:-8444}:8444"
+      # The package repositories, read-only. Job containers reach them
+      # over the network below, not through this port; it is for clients
+      # outside, and stays on the loopback address unless set otherwise.
+      - "${CI_REPO_BIND:-127.0.0.1}:${CI_REPO_PORT:-8445}:8445"
     volumes:
       - coordinator:/data
       - ./certs/server.pem:/certs/server.pem:ro
       - ./certs/server.key:/certs/server.key:ro
+      - ./secrets/signing-key:/run/ros2ci/signing-key:ro
 
   worker:
     # Started in a second step, once it has a token: see README.md.
@@ -81,6 +90,10 @@ services:
       - /work
       - --runtime
       - unix:///run/ros2ci/runtime.sock
+      # Job containers join the network these containers are on, so that
+      # a build can install packages from http://coordinator:8445/.
+      - --job-network
+      - ${CI_NETWORK:-ros2ci}
     # The runtime's socket carries no label a confined container may use.
     security_opt:
       - label=disable
@@ -89,6 +102,11 @@ services:
       - ./secrets/worker-token:/run/ros2ci/worker-token:ro
       - ./certs/ca.pem:/run/ros2ci/ca.pem:ro
       - ${CI_RUNTIME_SOCKET:?set CI_RUNTIME_SOCKET in .env}:/run/ros2ci/runtime.sock
+
+networks:
+  default:
+    # A fixed name, because the worker gives it to the container runtime.
+    name: ${CI_NETWORK:-ros2ci}
 
 volumes:
   postgres:

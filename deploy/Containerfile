@@ -26,7 +26,7 @@ USER ros2ci
 ENV CI_ADMIN_URL=http://127.0.0.1:8444 \
     CI_ADMIN_TOKEN_FILE=/data/admin-token
 VOLUME /data
-EXPOSE 8443 8444
+EXPOSE 8443 8444 8445
 ENTRYPOINT ["ci-coordinator"]
 CMD ["--data-dir", "/data", "--worker-listen", "0.0.0.0:8443", "--admin-listen", "0.0.0.0:8444"]
 

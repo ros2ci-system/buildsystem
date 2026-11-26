@@ -1,7 +1,7 @@
 // Copyright 2026 The ros2ci authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Hashing, message authentication, key derivation and random numbers,
+//! Hashing, message authentication, signatures, key derivation and random numbers,
 //! plus the base64 and hex encodings that travel with them.
 //!
 //! The cryptography itself comes from `ring`, the provider that rustls is
@@ -44,6 +44,73 @@ impl Default for Sha256 {
     fn default() -> Sha256 {
         Sha256::new()
     }
+}
+
+pub const SHA512_LEN: usize = 64;
+
+pub fn sha512(data: &[u8]) -> [u8; SHA512_LEN] {
+    let digest = ring::digest::digest(&ring::digest::SHA512, data);
+    let mut out = [0u8; SHA512_LEN];
+    out.copy_from_slice(digest.as_ref());
+    out
+}
+
+pub const SHA1_LEN: usize = 20;
+
+/// SHA-1, which is broken as a secure hash. It is here only because an
+/// OpenPGP version 4 key is named by the SHA-1 of its public part.
+/// Nothing may rely on it for security.
+pub fn sha1_for_key_names(data: &[u8]) -> [u8; SHA1_LEN] {
+    let digest = ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, data);
+    let mut out = [0u8; SHA1_LEN];
+    out.copy_from_slice(digest.as_ref());
+    out
+}
+
+pub const ED25519_SEED_LEN: usize = 32;
+pub const ED25519_PUBLIC_LEN: usize = 32;
+pub const ED25519_SIGNATURE_LEN: usize = 64;
+
+/// An Ed25519 signing key, held as its 32-byte seed.
+pub struct Ed25519Key(ring::signature::Ed25519KeyPair);
+
+impl Ed25519Key {
+    /// A new key from the operating system's random numbers. Returns the
+    /// seed too, which is all that has to be stored to load it again.
+    pub fn generate() -> (Ed25519Key, [u8; ED25519_SEED_LEN]) {
+        let mut seed = [0u8; ED25519_SEED_LEN];
+        random_bytes(&mut seed);
+        let key = Ed25519Key::from_seed(&seed);
+        (key, seed)
+    }
+
+    pub fn from_seed(seed: &[u8; ED25519_SEED_LEN]) -> Ed25519Key {
+        Ed25519Key(
+            ring::signature::Ed25519KeyPair::from_seed_unchecked(seed)
+                .expect("a 32-byte seed is always a valid Ed25519 key"),
+        )
+    }
+
+    pub fn public_key(&self) -> [u8; ED25519_PUBLIC_LEN] {
+        use ring::signature::KeyPair;
+        let mut out = [0u8; ED25519_PUBLIC_LEN];
+        out.copy_from_slice(self.0.public_key().as_ref());
+        out
+    }
+
+    pub fn sign(&self, message: &[u8]) -> [u8; ED25519_SIGNATURE_LEN] {
+        let mut out = [0u8; ED25519_SIGNATURE_LEN];
+        out.copy_from_slice(self.0.sign(message).as_ref());
+        out
+    }
+}
+
+/// Whether `signature` is this public key's Ed25519 signature of
+/// `message`.
+pub fn ed25519_verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, public_key)
+        .verify(message, signature)
+        .is_ok()
 }
 
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; SHA256_LEN] {
@@ -225,6 +292,47 @@ mod tests {
         pieces.update(b"a");
         pieces.update(b"bc");
         assert_eq!(pieces.finish(), sha256(b"abc"));
+    }
+
+    #[test]
+    fn other_hashes_known_answers() {
+        assert_eq!(
+            hex_encode(&sha1_for_key_names(b"abc")),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+        assert_eq!(
+            hex_encode(&sha512(b"abc")),
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a\
+             2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+        );
+    }
+
+    #[test]
+    fn ed25519_known_answer() {
+        // RFC 8032, section 7.1, test 2.
+        let seed: [u8; 32] =
+            hex_decode("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let key = Ed25519Key::from_seed(&seed);
+        assert_eq!(
+            hex_encode(&key.public_key()),
+            "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"
+        );
+        let signature = key.sign(&[0x72]);
+        assert_eq!(
+            hex_encode(&signature),
+            "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da\
+             085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"
+        );
+        assert!(ed25519_verify(&key.public_key(), &[0x72], &signature));
+        assert!(!ed25519_verify(&key.public_key(), &[0x73], &signature));
+        let (generated, stored) = Ed25519Key::generate();
+        assert_eq!(
+            Ed25519Key::from_seed(&stored).public_key(),
+            generated.public_key()
+        );
     }
 
     #[test]

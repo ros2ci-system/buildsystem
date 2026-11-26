@@ -25,6 +25,7 @@ dependencies = [
  "ci_http",
  "ci_json",
  "ci_net",
+ "ci_openpgp",
  "ci_tar",
 ]
 
@@ -58,6 +59,7 @@ dependencies = [
  "ci_http",
  "ci_json",
  "ci_net",
+ "ci_openpgp",
  "ci_postgres",
  "ci_protocol",
 ]
@@ -94,6 +96,13 @@ dependencies = [
  "ci_http",
  "rustls",
  "webpki-roots",
+]
+
+[[package]]
+name = "ci_openpgp"
+version = "0.1.0"
+dependencies = [
+ "ci_crypto",
 ]
 
 [[package]]

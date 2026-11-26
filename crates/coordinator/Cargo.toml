@@ -15,6 +15,7 @@ ci_crypto = { path = "../crypto" }
 ci_http = { path = "../http" }
 ci_json = { path = "../json" }
 ci_net = { path = "../net" }
+ci_openpgp = { path = "../openpgp" }
 ci_postgres = { path = "../postgres" }
 ci_protocol = { path = "../protocol" }
 

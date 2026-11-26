@@ -19,7 +19,8 @@ is connected to the ROS build farm or to any official ROS infrastructure.**
 
 | Crate | What it is |
 |---|---|
-| `crates/crypto` | Hashing and random numbers (from `ring`), base64 and hex |
+| `crates/crypto` | Hashing, Ed25519 signatures and random numbers (from `ring`), base64 and hex |
+| `crates/openpgp` | OpenPGP signatures over repository indexes: the public key, detached and cleartext signatures |
 | `crates/json` | JSON parser and serializer |
 | `crates/tar` | tar archive reader and writer |
 | `crates/http` | HTTP/1.1 client and server over any byte stream |
@@ -27,7 +28,7 @@ is connected to the ROS build farm or to any official ROS infrastructure.**
 | `crates/container` | Client for the Docker and Podman HTTP API, over a Unix socket or a Windows named pipe |
 | `crates/postgres` | PostgreSQL client: wire protocol, SCRAM-SHA-256 login, parameterised queries |
 | `crates/protocol` | What the coordinator and its workers say to each other |
-| `crates/coordinator` | The coordinator, `ci-coordinator`: the job queue and the worker and admin APIs |
+| `crates/coordinator` | The coordinator, `ci-coordinator`: the job queue, the worker and admin APIs, and the package repositories |
 | `crates/agent` | The worker agent, `ci-agent` |
 | `crates/admin` | The administrator's tool, `ci-admin` |
 | `crates/e2e` | End-to-end tests of all of the above together |
@@ -187,6 +188,43 @@ runs, so replacing a file takes effect at once.
 
 Files go in and out through the container runtime's API. Nothing is mounted
 from the host, so the agent can itself run in a container.
+
+### Package repositories
+
+The coordinator keeps apt and RPM repositories under `repos` in its data
+directory and writes and signs their indexes itself. The key is made
+with `ci-admin generate-signing-key` and given to the coordinator as
+`--signing-key`; it never reaches a worker. `--repo-listen` serves the
+repositories read-only.
+
+Publishing is a step of its own, after a build:
+
+```
+ci-admin create-repository --name rolling-resolute --format apt --suite resolute \
+    --version-suffix resolute --architectures amd64,arm64 --source-arch amd64
+ci-admin next-revision --repository rolling-resolute --package ament_package --version 0.19.1
+ci-admin submit --pool release --os linux --arch amd64 --job job.json --wait
+ci-admin publish --repository rolling-resolute --job 7 --package ament_package \
+    --version 0.19.1 --revision 1 --name ros-rolling-ament-package
+```
+
+- **The rebuild counter.** `next-revision` hands out 1 for the first build
+  of a version of a package and one more each time after. The build is
+  given it as its revision, and the package's version ends in it
+  (`0.19.1-1resolute`, `0.19.1-1.el10`). A counter is never handed out
+  twice, so a rebuild always sorts above what it replaces.
+- **What a job says is checked.** A package build describes its packages
+  in `repo-metadata.json`, in the words of the distribution's own tools.
+  A publish names the packages the build was for. A package with another
+  name, another version or another architecture is refused, and every
+  path, size and hash in the index is the coordinator's own.
+- **What is signed.** The top of each index (`InRelease` and
+  `Release.gpg` for apt, `repomd.xml.asc` for RPM), which names the files
+  under it by hash. Packages are not signed one by one. This is how the
+  ROS repositories are set up, and clients are configured the same way
+  (for dnf: `repo_gpgcheck=1`, `gpgcheck=0`).
+- **Nothing is compressed.** There is no compressor in this code. apt
+  and dnf both read the plain index files.
 
 ## Testing
 

@@ -12,6 +12,8 @@ use std::sync::Mutex;
 use ci_postgres::{Config, Connection, Error, Param, Row};
 use ci_protocol::Outcome;
 
+use crate::repo::{Format, Planned, Repository, Stored};
+
 /// The advisory lock that marks the one active coordinator. The number is
 /// arbitrary; it only has to be the same in every coordinator.
 const COORDINATOR_LOCK: i64 = 0x726f_7332_6369;
@@ -88,6 +90,46 @@ const MIGRATIONS: &[&str] = &[
     );",
     // 4: workers that have been asked to stop once they are idle.
     "ALTER TABLE workers ADD COLUMN draining boolean NOT NULL DEFAULT false;",
+    // 5: package repositories. A build is one package for one
+    // architecture; publishing it again replaces its files.
+    "CREATE TABLE repositories (
+        name text PRIMARY KEY,
+        format text NOT NULL CHECK (format IN ('apt', 'rpm')),
+        suite text NOT NULL,
+        version_suffix text NOT NULL,
+        architectures text NOT NULL,
+        source_arch text NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE TABLE repository_revisions (
+        repository text NOT NULL REFERENCES repositories (name),
+        package text NOT NULL,
+        version text NOT NULL,
+        revision bigint NOT NULL,
+        PRIMARY KEY (repository, package, version)
+    );
+    CREATE TABLE repository_builds (
+        repository text NOT NULL REFERENCES repositories (name),
+        package text NOT NULL,
+        arch text NOT NULL,
+        version text NOT NULL,
+        revision bigint NOT NULL,
+        job_id bigint NOT NULL REFERENCES jobs (id),
+        attempt bigint NOT NULL,
+        published_at timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (repository, package, arch)
+    );
+    CREATE TABLE repository_files (
+        repository text NOT NULL REFERENCES repositories (name),
+        package text NOT NULL,
+        arch text NOT NULL,
+        path text NOT NULL,
+        section text NOT NULL,
+        size bigint NOT NULL,
+        sha256 text NOT NULL,
+        metadata text NOT NULL,
+        PRIMARY KEY (repository, path)
+    );",
 ];
 
 const TIMESTAMP: &str = "'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'";
@@ -174,6 +216,18 @@ pub struct JobStatus {
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
     pub artifacts: Vec<Artifact>,
+}
+
+/// A package build that a repository holds.
+#[derive(Debug, Clone)]
+pub struct PublishedBuild {
+    pub package: String,
+    pub arch: String,
+    pub version: String,
+    pub revision: i64,
+    pub job_id: i64,
+    pub attempt: i64,
+    pub published_at: String,
 }
 
 /// What happened to a job that failed for an infrastructure reason.
@@ -272,6 +326,201 @@ impl Db {
     pub fn delete_stored_file(&self, name: &str) -> Result<bool, Error> {
         self.with(|c| {
             Ok(c.execute("DELETE FROM stored_files WHERE name = $1", &[name.into()])? > 0)
+        })
+    }
+
+    /// Records a new repository. Returns `false` when the name is taken.
+    pub fn create_repository(&self, repository: &Repository) -> Result<bool, Error> {
+        self.with(|c| {
+            Ok(c.execute(
+                "INSERT INTO repositories (name, format, suite, version_suffix, architectures, source_arch)
+                 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (name) DO NOTHING",
+                &[
+                    (&repository.name).into(),
+                    repository.format.as_str().into(),
+                    (&repository.suite).into(),
+                    (&repository.version_suffix).into(),
+                    (&repository.architectures.join(" ")).into(),
+                    (&repository.source_arch).into(),
+                ],
+            )? > 0)
+        })
+    }
+
+    pub fn repository(&self, name: &str) -> Result<Option<Repository>, Error> {
+        self.with(|c| {
+            c.query(
+                "SELECT name, format, suite, version_suffix, architectures, source_arch
+                 FROM repositories WHERE name = $1",
+                &[name.into()],
+            )?
+            .first()
+            .map(|row| {
+                Ok(Repository {
+                    name: row.text(0)?.to_string(),
+                    format: Format::parse(row.text(1)?).ok_or_else(|| {
+                        Error::Protocol("a repository has an unknown format".to_string())
+                    })?,
+                    suite: row.text(2)?.to_string(),
+                    version_suffix: row.text(3)?.to_string(),
+                    architectures: row.text(4)?.split(' ').map(str::to_string).collect(),
+                    source_arch: row.text(5)?.to_string(),
+                })
+            })
+            .transpose()
+        })
+    }
+
+    /// Hands out the next rebuild counter for a version of a package:
+    /// 1 the first time, and one more each time after. A counter is
+    /// never given twice, whether or not its build is ever published.
+    pub fn allocate_revision(
+        &self,
+        repository: &str,
+        package: &str,
+        version: &str,
+    ) -> Result<i64, Error> {
+        self.with(|c| {
+            c.query(
+                "INSERT INTO repository_revisions (repository, package, version, revision)
+                 VALUES ($1, $2, $3, 1)
+                 ON CONFLICT (repository, package, version)
+                 DO UPDATE SET revision = repository_revisions.revision + 1
+                 RETURNING revision",
+                &[repository.into(), package.into(), version.into()],
+            )?
+            .first()
+            .ok_or_else(no_row)?
+            .int(0)
+        })
+    }
+
+    /// The highest rebuild counter handed out so far, if any.
+    pub fn allocated_revision(
+        &self,
+        repository: &str,
+        package: &str,
+        version: &str,
+    ) -> Result<Option<i64>, Error> {
+        self.with(|c| {
+            c.query(
+                "SELECT revision FROM repository_revisions
+                 WHERE repository = $1 AND package = $2 AND version = $3",
+                &[repository.into(), package.into(), version.into()],
+            )?
+            .first()
+            .map(|row| row.int(0))
+            .transpose()
+        })
+    }
+
+    pub fn repository_builds(&self, repository: &str) -> Result<Vec<PublishedBuild>, Error> {
+        self.with(|c| {
+            c.query(
+                &format!(
+                    "SELECT package, arch, version, revision, job_id, attempt,
+                            to_char(published_at AT TIME ZONE 'UTC', {TIMESTAMP})
+                     FROM repository_builds WHERE repository = $1 ORDER BY package, arch"
+                ),
+                &[repository.into()],
+            )?
+            .iter()
+            .map(|row| {
+                Ok(PublishedBuild {
+                    package: row.text(0)?.to_string(),
+                    arch: row.text(1)?.to_string(),
+                    version: row.text(2)?.to_string(),
+                    revision: row.int(3)?,
+                    job_id: row.int(4)?,
+                    attempt: row.int(5)?,
+                    published_at: row.text(6)?.to_string(),
+                })
+            })
+            .collect()
+        })
+    }
+
+    /// Makes a build the published one for its package and architecture,
+    /// in one transaction. Returns the paths of the files it replaced.
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_repository_build(
+        &self,
+        repository: &str,
+        package: &str,
+        arch: &str,
+        version: &str,
+        revision: i64,
+        job_id: i64,
+        attempt: i64,
+        files: &[Planned],
+    ) -> Result<Vec<String>, Error> {
+        self.with(|c| {
+            c.transaction(|c| {
+                let replaced = c
+                    .query(
+                        "DELETE FROM repository_files
+                         WHERE repository = $1 AND package = $2 AND arch = $3 RETURNING path",
+                        &[repository.into(), package.into(), arch.into()],
+                    )?
+                    .iter()
+                    .map(|row| row.text(0).map(str::to_string))
+                    .collect::<Result<Vec<_>, _>>()?;
+                for file in files {
+                    c.execute(
+                        "INSERT INTO repository_files
+                             (repository, package, arch, path, section, size, sha256, metadata)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                        &[
+                            repository.into(),
+                            package.into(),
+                            arch.into(),
+                            (&file.path).into(),
+                            (&file.section).into(),
+                            file.size.into(),
+                            (&file.sha256).into(),
+                            (&file.metadata).into(),
+                        ],
+                    )?;
+                }
+                c.execute(
+                    "INSERT INTO repository_builds
+                         (repository, package, arch, version, revision, job_id, attempt)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7)
+                     ON CONFLICT (repository, package, arch) DO UPDATE
+                     SET version = excluded.version, revision = excluded.revision,
+                         job_id = excluded.job_id, attempt = excluded.attempt,
+                         published_at = now()",
+                    &[
+                        repository.into(),
+                        package.into(),
+                        arch.into(),
+                        version.into(),
+                        revision.into(),
+                        job_id.into(),
+                        attempt.into(),
+                    ],
+                )?;
+                Ok(replaced)
+            })
+        })
+    }
+
+    /// Every file a repository holds, as its index needs them.
+    pub fn repository_files(&self, repository: &str) -> Result<Vec<Stored>, Error> {
+        self.with(|c| {
+            c.query(
+                "SELECT path, section, metadata FROM repository_files WHERE repository = $1",
+                &[repository.into()],
+            )?
+            .iter()
+            .map(|row| {
+                Ok(Stored {
+                    path: row.text(0)?.to_string(),
+                    section: row.text(1)?.to_string(),
+                    metadata: row.text(2)?.to_string(),
+                })
+            })
+            .collect()
         })
     }
 
