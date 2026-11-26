@@ -27,6 +27,7 @@ use ci_protocol::{
 use crate::db::{self, Artifact, Db, Requeue, Worker};
 
 mod archive;
+mod reconciler;
 mod repositories;
 
 /// Largest JSON request body accepted. A Report carries a chunk of log,
@@ -58,6 +59,10 @@ pub struct Coordinator {
     /// Held while a repository changes, so that two publishes cannot
     /// write one index at the same time.
     pub publishing: std::sync::Mutex<()>,
+    /// Held during a step of the reconciler, so that two never overlap.
+    pub reconciling: std::sync::Mutex<()>,
+    /// For asking forges which commit a branch is at.
+    pub forges: ci_net::Connector,
 }
 
 /// An error reply: a status and a message for the caller.
@@ -612,6 +617,12 @@ impl Coordinator {
             ("GET", ["admin", "v1", "jobs", id, "artifacts", rest @ ..]) if !rest.is_empty() => {
                 self.job_artifact(job(id)?, &rest.join("/"))
             }
+            ("PUT", ["admin", "v1", "reconciler"]) => self.configure_reconciler(&admin, request),
+            ("GET", ["admin", "v1", "reconciler"]) => self.reconciler_status(),
+            ("POST", ["admin", "v1", "reconciler", "rebuild"]) => {
+                self.rebuild_package(&admin, request)
+            }
+            ("POST", ["admin", "v1", "reconciler", "intake"]) => self.retry_intake(&admin),
             ("POST", ["admin", "v1", "archive"]) => self.archive_release(&admin, request),
             ("GET", ["admin", "v1", "archive", rosdistro]) => self.archived_releases(rosdistro),
             ("POST", ["admin", "v1", "repositories"]) => self.create_repository(&admin, request),
@@ -806,8 +817,25 @@ impl Coordinator {
         }
         let description = body
             .get("description")
-            .ok_or_else(|| reject(400, "\"description\" is required"))?
-            .to_json();
+            .ok_or_else(|| reject(400, "\"description\" is required"))?;
+        let id = self.submit_description(pool, os, arch, description)?;
+        eprintln!("admin {admin:?}: submitted job {id}: pool {pool}, {os}/{arch}");
+        Ok(Response::json(
+            201,
+            Value::object([("job_id", Value::Int(id))]).to_json(),
+        ))
+    }
+
+    /// Checks a job description and queues it. The reconciler queues
+    /// its jobs through this too.
+    fn submit_description(
+        &self,
+        pool: &str,
+        os: &str,
+        arch: &str,
+        description: &Value,
+    ) -> Result<i64, Reject> {
+        let description = description.to_json();
         let parsed = JobDescription::parse(&description)
             .map_err(|e| Reject(400, format!("job description: {e}")))?;
         if parsed.has_local_inputs() {
@@ -835,12 +863,7 @@ impl Coordinator {
                 ));
             }
         }
-        let id = self.db.submit_job(pool, os, arch, &description)?;
-        eprintln!("admin {admin:?}: submitted job {id}: pool {pool}, {os}/{arch}");
-        Ok(Response::json(
-            201,
-            Value::object([("job_id", Value::Int(id))]).to_json(),
-        ))
+        Ok(self.db.submit_job(pool, os, arch, &description)?)
     }
 
     fn job_status(&self, job_id: i64) -> Result<Response, Reject> {

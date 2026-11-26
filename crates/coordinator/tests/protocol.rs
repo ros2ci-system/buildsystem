@@ -2138,3 +2138,272 @@ fn a_release_is_archived_once_and_read_by_hash() {
         "that job is finished and never named it"
     );
 }
+
+/// Answers the first request of a git fetch: the list of refs, with one
+/// branch at the commit given.
+fn serve_git_refs(commit: &'static str) -> String {
+    use std::io::{Read, Write};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            let packet = |text: String| format!("{:04x}{text}", text.len() + 4);
+            let body = [
+                packet("# service=git-upload-pack\n".to_string()),
+                "0000".to_string(),
+                packet(format!("{commit} HEAD\0multi_ack\n")),
+                packet(format!("{commit} refs/heads/main\n")),
+                "0000".to_string(),
+            ]
+            .concat();
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        }
+    });
+    format!("http://{address}/rosdistro.git")
+}
+
+#[test]
+fn the_reconciler_takes_a_release_in_and_builds_it_in_order() {
+    let key_path = std::env::temp_dir().join(format!("ros2ci-test-key-r-{}", std::process::id()));
+    let key =
+        ci_openpgp::SigningKey::generate("Test <test@example.invalid>", 1_795_000_000).unwrap();
+    fs::write(&key_path, key.to_file_text()).unwrap();
+    let Some(c) = Coordinator::start(&[
+        "--signing-key",
+        key_path.to_str().unwrap(),
+        "--reconcile-interval-seconds",
+        "1",
+    ]) else {
+        return;
+    };
+    let rosdistro_commit = "c0ffee0000000000000000000000000000000001";
+    let source_commit = "5".repeat(40);
+    let (status, reply) = c.admin(
+        "POST",
+        "/admin/v1/repositories",
+        Some(Value::object([
+            ("name", Value::from("test-apt")),
+            ("format", Value::from("apt")),
+            ("suite", Value::from("resolute")),
+            ("version_suffix", Value::from("resolute")),
+            ("architectures", Value::strings(["amd64"])),
+            ("source_arch", Value::from("amd64")),
+        ])),
+    );
+    assert_eq!(status, 201, "{reply:?}");
+
+    let place = |job: &str| {
+        format!(
+            r#"{{"pool": "release", "os": "linux", "arch": "amd64",
+                "job": {{"image": "registry.example/{job}", "command": ["run"], "timeout_seconds": 60}}}}"#
+        )
+    };
+    let config = format!(
+        r#"{{"rosdistro": "rolling", "rosdistro_repository": "{}", "rosdistro_branch": "main",
+            "rosdistro_files": "https://files.example.invalid/rosdistro", "poll_seconds": 10,
+            "build_retries": 0, "retry_backoff_seconds": 1,
+            "check": {}, "archive": {},
+            "targets": [{{"name": "ubuntu", "repository": "test-apt",
+                          "repository_url": "http://repo.example.invalid/test-apt",
+                          "platform": {{"os": "ubuntu", "version": "resolute"}},
+                          "names": ["ros-rolling-{{name}}"],
+                          "pool": "release", "os": "linux", "arch": "amd64",
+                          "job": {{"image": "registry.example/build", "command": ["run"],
+                                   "timeout_seconds": 60}}}}]}}"#,
+        serve_git_refs(rosdistro_commit),
+        place("check"),
+        place("archive"),
+    );
+    let (status, reply) = c.admin(
+        "PUT",
+        "/admin/v1/reconciler",
+        Some(ci_json::parse(&config).unwrap()),
+    );
+    assert_eq!(status, 200, "{reply:?}");
+
+    // The test is the worker. It takes whatever job comes next and
+    // returns its id, attempt and parameters.
+    let session = c.register("release", "linux", "amd64");
+    let next_job = || {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let (status, reply) = c.worker("/worker/v1/claim", &session, Value::object::<&str>([]));
+            assert_eq!(status, 200, "{reply:?}");
+            let job = reply.get("job").unwrap();
+            if !job.is_null() {
+                let description = job.get("description").unwrap();
+                return (
+                    (
+                        job.get("job_id").unwrap().as_i64().unwrap(),
+                        job.get("attempt").unwrap().as_i64().unwrap(),
+                    ),
+                    description.get("parameters").unwrap().clone(),
+                    description.clone(),
+                );
+            }
+            assert!(Instant::now() < deadline, "the reconciler queued nothing");
+            thread::sleep(Duration::from_millis(200));
+        }
+    };
+    let finish_with = |job: (i64, i64), outcome: &str, files: &[(&str, &[u8])]| {
+        let mut listed = Vec::new();
+        for (path, data) in files {
+            let target = format!(
+                "/worker/v1/jobs/{}/attempts/{}/artifacts/{path}",
+                job.0, job.1
+            );
+            assert_eq!(
+                c.call(&c.worker_url, "PUT", &target, Some(&session), Some(data))
+                    .0,
+                200
+            );
+            listed.push(Value::object([
+                ("path", Value::from(*path)),
+                ("size", Value::Int(data.len() as i64)),
+                ("sha256", Value::from(hex_encode(&sha256(data)))),
+            ]));
+        }
+        assert_eq!(c.finish(&session, job, outcome, listed).0, 200);
+    };
+    let packages = r#"[{"name": "low", "path": "low", "version": "1.0.0", "build_type": "ament_cmake",
+              "depends": ["cmake"], "test_depends": [], "groups": []},
+            {"name": "high", "path": "high", "version": "1.0.0", "build_type": "ament_cmake",
+              "depends": ["low", "cmake"], "test_depends": [], "groups": []}]"#;
+
+    // The release check, for the commit the rosdistro's branch is at.
+    let (job, parameters, _) = next_job();
+    assert_eq!(str_of(&parameters, "job"), "release_check");
+    assert_eq!(
+        str_of(&parameters, "rosdistro_url"),
+        format!("https://files.example.invalid/rosdistro/{rosdistro_commit}")
+    );
+    let results = format!(
+        r#"{{"status": "success", "problems": [], "moved_tags": [], "releases": [
+              {{"repository": "repo", "url": "https://example.invalid/repo.git", "version": "1.0.0",
+                "tag": "1.0.0", "commit": "{source_commit}", "state": "new", "skipped": [],
+                "packages": {packages}}}]}}"#
+    );
+    finish_with(job, "success", &[("results.json", results.as_bytes())]);
+
+    // The source archive job for the one release.
+    let (job, parameters, _) = next_job();
+    assert_eq!(str_of(&parameters, "job"), "source_archive");
+    assert_eq!(str_of(&parameters, "commit"), source_commit);
+    let tarball = b"the source";
+    let record = format!(
+        r#"{{"repository": "repo", "url": "https://example.invalid/repo.git", "version": "1.0.0",
+            "tag": "1.0.0", "commit": "{source_commit}", "sha256": "{}", "skipped": [],
+            "packages": {packages}}}"#,
+        hex_encode(&sha256(tarball))
+    );
+    finish_with(
+        job,
+        "success",
+        &[
+            ("source.tar.gz", tarball),
+            ("record.json", record.as_bytes()),
+        ],
+    );
+
+    // A build job: the package it is for, its revision, and a package
+    // that it "builds".
+    let build = |expected: &str, outcome: &str| {
+        let (job, parameters, description) = next_job();
+        assert_eq!(str_of(&parameters, "package"), expected);
+        let revision = parameters.get("revision").unwrap().as_i64().unwrap();
+        let input = &description.get("inputs").unwrap().as_array().unwrap()[0];
+        assert_eq!(
+            str_of(input, "url"),
+            format!("archive:{}", hex_encode(&sha256(tarball)))
+        );
+        let metadata = format!(
+            r#"{{"version": 1, "format": "deb", "packages": [{{"file": "packages/p.deb", "kind": "binary",
+                "fields": [["Package", "ros-rolling-{expected}"], ["Version", "1.0.0-{revision}resolute"],
+                           ["Architecture", "amd64"]]}}]}}"#
+        );
+        finish_with(
+            job,
+            outcome,
+            &[
+                ("packages/p.deb", expected.as_bytes()),
+                ("repo-metadata.json", metadata.as_bytes()),
+            ],
+        );
+        revision
+    };
+    let states = || {
+        let (_, status) = c.admin("GET", "/admin/v1/reconciler", None);
+        let target = &status.get("targets").unwrap().as_array().unwrap()[0];
+        target
+            .get("packages")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                format!(
+                    "{} {} {}",
+                    str_of(p, "package"),
+                    str_of(p, "state"),
+                    p.get("revision").unwrap().as_i64().unwrap()
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let wait_for = |wanted: &[&str]| {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while states() != wanted {
+            assert!(Instant::now() < deadline, "the packages are {:?}", states());
+            thread::sleep(Duration::from_millis(200));
+        }
+    };
+
+    // "low" first, and "high" only once "low" is published.
+    assert_eq!(build("low", "success"), 1);
+    assert_eq!(build("high", "success"), 1);
+    wait_for(&["high up_to_date 1", "low up_to_date 1"]);
+    // Nothing more is queued once everything is up to date.
+    thread::sleep(Duration::from_secs(3));
+    let (_, reply) = c.worker("/worker/v1/claim", &session, Value::object::<&str>([]));
+    assert!(reply.get("job").unwrap().is_null());
+
+    // A rebuild of "low" takes "high" with it, each with the next counter.
+    let rebuild_low = || {
+        let (status, reply) = c.admin(
+            "POST",
+            "/admin/v1/reconciler/rebuild",
+            Some(Value::object([("package", Value::from("low"))])),
+        );
+        assert_eq!(status, 200, "{reply:?}");
+    };
+    rebuild_low();
+    assert_eq!(build("low", "success"), 2);
+    assert_eq!(build("high", "success"), 2);
+    wait_for(&["high up_to_date 2", "low up_to_date 2"]);
+
+    // A build that fails, with no retries allowed, stays failed, and
+    // what depends on it waits. What was published stays published.
+    rebuild_low();
+    assert_eq!(build("low", "build_failure"), 3);
+    wait_for(&["high blocked 2", "low failed 3"]);
+    let (_, status) = c.admin("GET", "/admin/v1/repositories/test-apt", None);
+    let published: Vec<i64> = status
+        .get("builds")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b.get("revision").unwrap().as_i64().unwrap())
+        .collect();
+    assert_eq!(published, [2, 2]);
+    let _ = fs::remove_file(&key_path);
+}

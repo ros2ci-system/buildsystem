@@ -86,13 +86,19 @@ impl Coordinator {
         request: &mut Request<'_>,
     ) -> Result<Response, Reject> {
         let body = read_json(request)?;
-        let job_id = int_field(&body, "job_id")?;
-        let rosdistro = str_field(&body, "rosdistro")?;
-        let repository = str_field(&body, "repository")?;
-        let version = str_field(&body, "version")?;
-        let url = str_field(&body, "url")?;
-        let tag = str_field(&body, "tag")?;
-        let commit = str_field(&body, "commit")?;
+        self.archive_job(admin, &body)
+    }
+
+    /// Archives a release from the body of an archive call. The
+    /// reconciler calls this too.
+    pub(super) fn archive_job(&self, admin: &str, body: &Value) -> Result<Response, Reject> {
+        let job_id = int_field(body, "job_id")?;
+        let rosdistro = str_field(body, "rosdistro")?;
+        let repository = str_field(body, "repository")?;
+        let version = str_field(body, "version")?;
+        let url = str_field(body, "url")?;
+        let tag = str_field(body, "tag")?;
+        let commit = str_field(body, "commit")?;
         if !is_label(rosdistro)
             || !is_ros_name(repository)
             || !is_version(version)
@@ -179,10 +185,39 @@ impl Coordinator {
                     ),
                 ));
             }
+            // The rosdep keys the package names, which is what orders
+            // builds once they are matched against the released packages.
+            let words = |name: &str| -> Vec<&str> {
+                package
+                    .get(name)
+                    .and_then(Value::as_array)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect()
+            };
+            // What it needs to build and run, what only its tests need,
+            // and the groups it is a member of.
+            let (depends, test_depends, groups) =
+                (words("depends"), words("test_depends"), words("groups"));
+            if !depends
+                .iter()
+                .chain(&test_depends)
+                .chain(&groups)
+                .all(|key| is_plain_text(key))
+            {
+                return Err(reject(
+                    400,
+                    "a package of the release is not described properly",
+                ));
+            }
             packages.push(Value::object([
                 ("name", Value::from(name)),
                 ("path", Value::from(path)),
                 ("build_type", Value::from(build_type)),
+                ("depends", Value::strings(depends)),
+                ("test_depends", Value::strings(test_depends)),
+                ("groups", Value::strings(groups)),
             ]));
         }
         if packages.is_empty() {
@@ -203,7 +238,22 @@ impl Coordinator {
             // changes nothing. Anything else is refused: what was
             // released stays what was released.
             if existing.commit == commit && existing.sha256 == tarball.sha256 {
-                return Ok(json_ok(release_json(&existing)));
+                // The same tarball again. What may differ is which of
+                // its packages are released, or how much is recorded
+                // about them; the record is brought up to date.
+                let mut updated = release_json(&existing);
+                if let Value::Object(members) = &mut updated {
+                    members.retain(|(name, _)| name != "packages" && name != "skipped");
+                    members.push(("packages".to_string(), Value::Array(packages)));
+                    members.push(("skipped".to_string(), Value::strings(skipped)));
+                }
+                let record = updated.to_json();
+                if record != existing.record {
+                    self.db
+                        .complete_archive_record(rosdistro, repository, version, &record)?;
+                    eprintln!("admin {admin:?}: updated the record of {repository} {version}");
+                }
+                return Ok(Response::json(200, record));
             }
             return Err(Reject(
                 409,

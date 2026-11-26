@@ -254,6 +254,40 @@ ci-admin archived
   to take each tarball in; the coordinator checks the job's own record
   against the release the command names.
 
+### The reconciler
+
+Given settings, the coordinator follows a rosdistro and keeps the
+repositories in step with it, with nobody running a command:
+
+```
+ci-admin reconcile-config home-lab.json
+ci-admin reconcile-status
+ci-admin rebuild --package rcutils
+```
+
+- **Intake.** It asks the rosdistro's git server which commit the branch
+  is at. For a new commit it runs the release check as a job, and then a
+  source archive job for each new release. Builds go on from the last
+  commit that was taken in whole; a commit whose check fails changes
+  nothing and is shown with its problems.
+- **Order and rebuilds come from one rule.** A package is up to date when
+  what is published was built from the release's source against the
+  builds of its dependencies that are published now. So a package waits
+  for its dependencies, and when a dependency is published again its
+  rebuild counter changes and the package is built again.
+- **States.** Each package of each target is up to date, queued,
+  building, blocked or failed. A failed build is tried again a set number
+  of times, with a delay that doubles; after that it stays failed until
+  its source or a dependency changes, or someone asks for a rebuild.
+- **Nothing is kept in memory.** Every step reads where things stand from
+  the database and writes down what it did. A restart, or a worker that
+  dies with a job, delays builds and loses none.
+- **Tests per target.** A target's settings say whether its builds run
+  the packages' tests. Without tests, a package does not wait for what
+  only its tests depend on.
+- **Not done:** removing from a repository a package that is no longer
+  released; rebuilding when the job image or the job script changes.
+
 ## Testing
 
 The tests are defined by `ci/Dockerfile.test` and run the same way anywhere

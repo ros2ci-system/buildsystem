@@ -10,6 +10,7 @@
 
 mod api;
 mod db;
+mod gitrefs;
 mod repo;
 
 use std::net::TcpListener;
@@ -46,6 +47,9 @@ option, so that the password does not show in the process list.
   --signing-key <file>       The key that signs repository indexes, as
                              the ci-admin generate-signing-key command writes it.
                              Without it nothing can be published.
+  --reconcile-interval-seconds <n>
+                             How often the reconciler takes a step.
+                             Default 5.
   --lease-seconds <n>        How long a job stays claimed without a Report.
                              Default 60.
   --report-interval-seconds <n>
@@ -68,6 +72,7 @@ struct Options {
     repo_listen: Option<String>,
     signing_key: Option<PathBuf>,
     settings_numbers: [i64; 5],
+    reconcile_interval: u64,
 }
 
 fn parse_options(args: &[String]) -> Result<Options, String> {
@@ -78,6 +83,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
     let mut tls_key = None;
     let mut repo_listen = None;
     let mut signing_key = None;
+    let mut reconcile_interval = 5;
     // lease, report interval, claim interval, max failures, backoff
     let mut numbers = [60i64, 10, 3, 3, 30];
     let mut iter = args.iter();
@@ -101,6 +107,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
             "--tls-key" => tls_key = Some(PathBuf::from(value()?)),
             "--repo-listen" => repo_listen = Some(value()?),
             "--signing-key" => signing_key = Some(PathBuf::from(value()?)),
+            "--reconcile-interval-seconds" => reconcile_interval = number(value()?)? as u64,
             "--lease-seconds" => numbers[0] = number(value()?)?,
             "--report-interval-seconds" => numbers[1] = number(value()?)?,
             "--claim-interval-seconds" => numbers[2] = number(value()?)?,
@@ -123,6 +130,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
         tls_key,
         repo_listen,
         signing_key,
+        reconcile_interval,
         settings_numbers: numbers,
     })
 }
@@ -177,6 +185,8 @@ fn run(args: &[String]) -> Result<(), String> {
     let coordinator = Arc::new(Coordinator {
         signing_key,
         publishing: std::sync::Mutex::new(()),
+        reconciling: std::sync::Mutex::new(()),
+        forges: ci_net::Connector::with_public_roots(None).map_err(|e| e.to_string())?,
         db: db::Db::open(database)?,
         settings: Settings {
             data_dir: options.data_dir.clone(),
@@ -238,6 +248,26 @@ fn run(args: &[String]) -> Result<(), String> {
                 |socket| Ok(Stream::Plain(socket)),
                 move |request| coordinator.handle_admin(request),
             )
+        });
+    }
+    {
+        // The reconciler does nothing until it is given settings.
+        let coordinator = Arc::clone(&coordinator);
+        let interval = Duration::from_secs(options.reconcile_interval);
+        thread::spawn(move || {
+            let mut last_error = String::new();
+            loop {
+                thread::sleep(interval);
+                match coordinator.reconcile() {
+                    Ok(()) => last_error.clear(),
+                    // The same trouble every five seconds is said once.
+                    Err(message) if message != last_error => {
+                        eprintln!("reconciler: {message}");
+                        last_error = message;
+                    }
+                    Err(_) => {}
+                }
+            }
         });
     }
     if let Some(address) = &options.repo_listen {

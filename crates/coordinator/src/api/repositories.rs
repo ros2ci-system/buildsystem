@@ -268,13 +268,24 @@ impl Coordinator {
         name: &str,
         request: &mut Request<'_>,
     ) -> Result<Response, Reject> {
+        let body = read_json(request)?;
+        self.publish_build(admin, name, &body)
+    }
+
+    /// Publishes the packages a finished job built, from the body of a
+    /// publish call. The reconciler calls this too.
+    pub(super) fn publish_build(
+        &self,
+        admin: &str,
+        name: &str,
+        body: &Value,
+    ) -> Result<Response, Reject> {
         let key = self.signing_key()?;
         let repository = self.load_repository(name)?;
-        let body = read_json(request)?;
-        let job_id = int_field(&body, "job_id")?;
-        let package = str_field(&body, "package")?;
-        let version = str_field(&body, "version")?;
-        let revision = int_field(&body, "revision")?;
+        let job_id = int_field(body, "job_id")?;
+        let package = str_field(body, "package")?;
+        let version = str_field(body, "version")?;
+        let revision = int_field(body, "revision")?;
         let names: Vec<String> = body
             .get("names")
             .and_then(Value::as_array)

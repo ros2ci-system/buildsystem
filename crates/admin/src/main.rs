@@ -78,6 +78,21 @@ Commands:
       release could not be archived; nothing is archived after a problem.
   archived [--rosdistro <name>]
       Lists the releases in the source archive, as JSON.
+  reconcile-config <file>
+      Gives the reconciler its settings, a JSON file: the rosdistro to
+      follow, the release check and source archive jobs, and the targets
+      to build for. From then on it takes in each new rosdistro commit
+      and builds and publishes what is missing, in dependency order.
+  reconcile-status [--all] [--json]
+      Shows the rosdistro commit being built from and the state of the
+      packages of each target. Without --all, only packages that are not
+      up to date are listed.
+  reconcile-now
+      Makes the reconciler take the rosdistro in again now, even if its
+      commit has not changed.
+  rebuild --package <package> [--target <target>]
+      Has a package built again, on one target or on all. Everything that
+      depends on it is then built again too.
   generate-signing-key --user-id <text> --output <file>
       Makes the key that signs repository indexes and writes it to a new
       file that only you can read. It talks to no coordinator and needs
@@ -640,6 +655,141 @@ fn run(admin: &Admin, command: &str, args: &[String]) -> Result<ExitCode, String
                 None,
             )?;
             print!("{}", archived.to_json_pretty());
+            Ok(ExitCode::SUCCESS)
+        }
+        "reconcile-config" => {
+            let (options, positional) = parse_args(args, &[])?;
+            only_options(&options, &[])?;
+            let path = positional.first().ok_or("a settings file is required")?;
+            let text = fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+            let config = ci_json::parse(&text).map_err(|e| format!("{path}: {e}"))?;
+            admin.json("PUT", "/admin/v1/reconciler", Some(&config))?;
+            Ok(ExitCode::SUCCESS)
+        }
+        "reconcile-now" => {
+            let (options, positional) = parse_args(args, &[])?;
+            only_options(&options, &[])?;
+            if !positional.is_empty() {
+                return Err(format!("unexpected argument {:?}", positional[0]));
+            }
+            admin.json("POST", "/admin/v1/reconciler/intake", None)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        "rebuild" => {
+            let (options, positional) = parse_args(args, &[])?;
+            only_options(&options, &["package", "target"])?;
+            if !positional.is_empty() {
+                return Err(format!("unexpected argument {:?}", positional[0]));
+            }
+            let mut body = vec![("package", Value::from(option(&options, "package")?))];
+            if let Ok(target) = option(&options, "target") {
+                body.push(("target", Value::from(target)));
+            }
+            admin.json(
+                "POST",
+                "/admin/v1/reconciler/rebuild",
+                Some(&Value::object(body)),
+            )?;
+            Ok(ExitCode::SUCCESS)
+        }
+        "reconcile-status" => {
+            let (options, positional) = parse_args(args, &["all", "json"])?;
+            only_options(&options, &["all", "json"])?;
+            if !positional.is_empty() {
+                return Err(format!("unexpected argument {:?}", positional[0]));
+            }
+            let status = admin.json("GET", "/admin/v1/reconciler", None)?;
+            if options.iter().any(|(name, _)| name == "json") {
+                print!("{}", status.to_json_pretty());
+                return Ok(ExitCode::SUCCESS);
+            }
+            let all = options.iter().any(|(name, _)| name == "all");
+            let word = |value: &Value, name: &str| {
+                value
+                    .get(name)
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let list = |value: &Value, name: &str| {
+                value
+                    .get(name)
+                    .and_then(Value::as_array)
+                    .unwrap_or_default()
+                    .to_vec()
+            };
+            println!(
+                "{}: building from rosdistro commit {}",
+                word(&status, "rosdistro"),
+                match word(&status, "built_from_commit").as_str() {
+                    "" => "(none taken in yet)".to_string(),
+                    commit => commit.to_string(),
+                }
+            );
+            if let Some(intake) = status.get("intake").filter(|intake| !intake.is_null()) {
+                let message = word(intake, "message");
+                println!(
+                    "last looked at commit {}: {}{}",
+                    word(intake, "commit"),
+                    word(intake, "state"),
+                    if message.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({message})")
+                    }
+                );
+                for problem in list(intake, "problems") {
+                    println!(
+                        "  PROBLEM: {} {}: {}",
+                        word(&problem, "repository"),
+                        word(&problem, "package"),
+                        word(&problem, "message")
+                    );
+                }
+                for moved in list(intake, "moved_tags") {
+                    println!(
+                        "  MOVED TAG: {} {}: archived as {}, now {}",
+                        word(&moved, "repository"),
+                        word(&moved, "version"),
+                        word(&moved, "archived_commit"),
+                        word(&moved, "commit_now")
+                    );
+                }
+            }
+            for target in list(&status, "targets") {
+                let counts: Vec<String> = target
+                    .get("counts")
+                    .and_then(Value::as_object)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|(state, n)| format!("{} {state}", n.as_i64().unwrap_or(0)))
+                    .collect();
+                let packages = list(&target, "packages");
+                println!(
+                    "{}: {} packages: {}",
+                    word(&target, "name"),
+                    packages.len(),
+                    counts.join(", ")
+                );
+                for package in packages {
+                    let state = word(&package, "state");
+                    if state == "up_to_date" && !all {
+                        continue;
+                    }
+                    println!(
+                        "  {:<10} {:<36} {}-{} job {} {}",
+                        state,
+                        word(&package, "package"),
+                        word(&package, "version"),
+                        package.get("revision").and_then(Value::as_i64).unwrap_or(0),
+                        package
+                            .get("job_id")
+                            .and_then(Value::as_i64)
+                            .map_or("-".to_string(), |id| id.to_string()),
+                        word(&package, "message")
+                    );
+                }
+            }
             Ok(ExitCode::SUCCESS)
         }
         "create-repository" => {

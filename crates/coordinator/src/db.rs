@@ -145,6 +145,38 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (rosdistro, repository, version)
     );
     CREATE INDEX source_archive_sha256 ON source_archive (sha256);",
+    // 7: the reconciler. Its settings, each rosdistro commit it took in,
+    // and the last build of each package for each target.
+    "CREATE TABLE reconciler (
+        id bigint PRIMARY KEY CHECK (id = 1),
+        config text NOT NULL,
+        polled_at timestamptz,
+        intake_asked boolean NOT NULL DEFAULT false
+    );
+    CREATE TABLE intakes (
+        id bigserial PRIMARY KEY,
+        commit_id text NOT NULL,
+        state text NOT NULL CHECK (state IN ('checking', 'archiving', 'done', 'failed')),
+        check_job bigint NOT NULL REFERENCES jobs (id),
+        detail text NOT NULL DEFAULT '{}',
+        created_at timestamptz NOT NULL DEFAULT now(),
+        finished_at timestamptz
+    );
+    CREATE TABLE package_builds (
+        target text NOT NULL,
+        package text NOT NULL,
+        state text NOT NULL,
+        status text NOT NULL,
+        inputs text NOT NULL,
+        version text NOT NULL,
+        revision bigint NOT NULL,
+        job_id bigint REFERENCES jobs (id),
+        attempts bigint NOT NULL DEFAULT 0,
+        next_retry_at timestamptz,
+        message text NOT NULL DEFAULT '',
+        updated_at timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (target, package)
+    );",
 ];
 
 const TIMESTAMP: &str = "'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'";
@@ -243,6 +275,41 @@ pub struct PublishedBuild {
     pub job_id: i64,
     pub attempt: i64,
     pub published_at: String,
+}
+
+/// A rosdistro commit the reconciler took in, or is taking in.
+#[derive(Debug, Clone)]
+pub struct Intake {
+    pub id: i64,
+    pub commit: String,
+    /// `checking`, `archiving`, `done` or `failed`.
+    pub state: String,
+    pub check_job: i64,
+    /// What the release check found and which archive jobs run, as JSON.
+    pub detail: String,
+    pub created_at: String,
+}
+
+/// The last build of a package for a target, as the reconciler keeps it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageBuild {
+    pub package: String,
+    /// Where the last build stands: `none`, `building`, `published`,
+    /// `failed`, or `stale` when a rebuild was asked for.
+    pub state: String,
+    /// The package's state as the design names them, for showing.
+    pub status: String,
+    /// What the last build was made from.
+    pub inputs: String,
+    pub version: String,
+    pub revision: i64,
+    pub job_id: Option<i64>,
+    /// How many times a build from these inputs has failed.
+    pub attempts: i64,
+    /// Whether the time for the next retry has come.
+    pub retry_due: bool,
+    pub next_retry_at: Option<String>,
+    pub message: String,
 }
 
 /// A release in the source archive.
@@ -559,6 +626,30 @@ impl Db {
         })
     }
 
+    /// Replaces what is recorded about an archived release. The tarball
+    /// and the commit it came from are not touched.
+    pub fn complete_archive_record(
+        &self,
+        rosdistro: &str,
+        repository: &str,
+        version: &str,
+        record: &str,
+    ) -> Result<(), Error> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE source_archive SET record = $4
+                 WHERE rosdistro = $1 AND repository = $2 AND version = $3",
+                &[
+                    rosdistro.into(),
+                    repository.into(),
+                    version.into(),
+                    record.into(),
+                ],
+            )
+            .map(|_| ())
+        })
+    }
+
     pub fn archived_release(
         &self,
         rosdistro: &str,
@@ -602,6 +693,214 @@ impl Db {
                     &[sha256.into()],
                 )?
                 .is_empty())
+        })
+    }
+
+    pub fn reconciler_config(&self) -> Result<Option<String>, Error> {
+        self.with(|c| {
+            c.query("SELECT config FROM reconciler WHERE id = 1", &[])?
+                .first()
+                .map(|row| row.text(0).map(str::to_string))
+                .transpose()
+        })
+    }
+
+    /// Stores the reconciler's settings, and makes it look at the
+    /// rosdistro at once.
+    pub fn set_reconciler_config(&self, config: &str) -> Result<(), Error> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO reconciler (id, config) VALUES (1, $1)
+                 ON CONFLICT (id) DO UPDATE SET config = excluded.config, polled_at = NULL",
+                &[config.into()],
+            )
+            .map(|_| ())
+        })
+    }
+
+    /// Whether it is time to ask the rosdistro for its commit again. If
+    /// it is, the time of asking is recorded.
+    pub fn reconciler_poll_due(&self, seconds: i64) -> Result<bool, Error> {
+        self.with(|c| {
+            Ok(c.execute(
+                "UPDATE reconciler SET polled_at = now()
+                 WHERE id = 1 AND (polled_at IS NULL
+                     OR polled_at < now() - $1::bigint * interval '1 second')",
+                &[seconds.into()],
+            )? > 0)
+        })
+    }
+
+    /// Records that someone asked for the rosdistro to be taken in again.
+    pub fn ask_for_intake(&self) -> Result<(), Error> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE reconciler SET intake_asked = true WHERE id = 1",
+                &[],
+            )
+            .map(|_| ())
+        })
+    }
+
+    /// Whether someone asked for the rosdistro to be taken in again.
+    /// Asking is used up by this.
+    pub fn take_intake_request(&self) -> Result<bool, Error> {
+        self.with(|c| {
+            Ok(c.execute(
+                "UPDATE reconciler SET intake_asked = false WHERE id = 1 AND intake_asked",
+                &[],
+            )? > 0)
+        })
+    }
+
+    fn intake_where(&self, condition: &str) -> Result<Option<Intake>, Error> {
+        self.with(|c| {
+            c.query(
+                &format!(
+                    "SELECT id, commit_id, state, check_job, detail,
+                            to_char(created_at AT TIME ZONE 'UTC', {TIMESTAMP})
+                     FROM intakes {condition} ORDER BY id DESC LIMIT 1"
+                ),
+                &[],
+            )?
+            .first()
+            .map(|row| {
+                Ok(Intake {
+                    id: row.int(0)?,
+                    commit: row.text(1)?.to_string(),
+                    state: row.text(2)?.to_string(),
+                    check_job: row.int(3)?,
+                    detail: row.text(4)?.to_string(),
+                    created_at: row.text(5)?.to_string(),
+                })
+            })
+            .transpose()
+        })
+    }
+
+    /// The rosdistro commit the reconciler looked at last.
+    pub fn latest_intake(&self) -> Result<Option<Intake>, Error> {
+        self.intake_where("")
+    }
+
+    /// The last rosdistro commit that was taken in whole.
+    pub fn last_done_intake(&self) -> Result<Option<Intake>, Error> {
+        self.intake_where("WHERE state = 'done'")
+    }
+
+    pub fn start_intake(&self, commit: &str, check_job: i64) -> Result<(), Error> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO intakes (commit_id, state, check_job) VALUES ($1, 'checking', $2)",
+                &[commit.into(), check_job.into()],
+            )
+            .map(|_| ())
+        })
+    }
+
+    pub fn update_intake(&self, id: i64, state: &str, detail: &str) -> Result<(), Error> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE intakes SET state = $2, detail = $3,
+                        finished_at = CASE WHEN $2 IN ('done', 'failed') THEN now() END
+                 WHERE id = $1",
+                &[id.into(), state.into(), detail.into()],
+            )
+            .map(|_| ())
+        })
+    }
+
+    /// The reconciler's record of every package of a target.
+    pub fn package_builds(&self, target: &str) -> Result<Vec<PackageBuild>, Error> {
+        self.with(|c| {
+            c.query(
+                &format!(
+                    "SELECT package, state, status, inputs, version, revision, job_id, attempts,
+                            coalesce(next_retry_at <= now(), true),
+                            to_char(next_retry_at AT TIME ZONE 'UTC', {TIMESTAMP}), message
+                     FROM package_builds WHERE target = $1 ORDER BY package"
+                ),
+                &[target.into()],
+            )?
+            .iter()
+            .map(|row| {
+                Ok(PackageBuild {
+                    package: row.text(0)?.to_string(),
+                    state: row.text(1)?.to_string(),
+                    status: row.text(2)?.to_string(),
+                    inputs: row.text(3)?.to_string(),
+                    version: row.text(4)?.to_string(),
+                    revision: row.int(5)?,
+                    job_id: row.opt_int(6)?,
+                    attempts: row.int(7)?,
+                    retry_due: row.bool(8)?,
+                    next_retry_at: row.get(9).map(str::to_string),
+                    message: row.text(10)?.to_string(),
+                })
+            })
+            .collect()
+        })
+    }
+
+    /// Writes a package's record. With `retry_in`, the next retry is
+    /// set to that many seconds from now; otherwise it is left alone.
+    pub fn save_package_build(
+        &self,
+        target: &str,
+        build: &PackageBuild,
+        retry_in: Option<i64>,
+    ) -> Result<(), Error> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO package_builds
+                     (target, package, state, status, inputs, version, revision, job_id,
+                      attempts, message, next_retry_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                         now() + $11::bigint * interval '1 second')
+                 ON CONFLICT (target, package) DO UPDATE
+                 SET state = excluded.state, status = excluded.status, inputs = excluded.inputs,
+                     version = excluded.version, revision = excluded.revision,
+                     job_id = excluded.job_id, attempts = excluded.attempts,
+                     message = excluded.message, updated_at = now(),
+                     next_retry_at = coalesce(excluded.next_retry_at, package_builds.next_retry_at)",
+                &[
+                    target.into(),
+                    (&build.package).into(),
+                    (&build.state).into(),
+                    (&build.status).into(),
+                    (&build.inputs).into(),
+                    (&build.version).into(),
+                    build.revision.into(),
+                    build.job_id.into(),
+                    build.attempts.into(),
+                    (&build.message).into(),
+                    retry_in.into(),
+                ],
+            )
+            .map(|_| ())
+        })
+    }
+
+    pub fn forget_package_build(&self, target: &str, package: &str) -> Result<(), Error> {
+        self.with(|c| {
+            c.execute(
+                "DELETE FROM package_builds WHERE target = $1 AND package = $2",
+                &[target.into(), package.into()],
+            )
+            .map(|_| ())
+        })
+    }
+
+    /// Makes the last build of a package count as out of date, on one
+    /// target or on all. Returns how many targets that changed.
+    pub fn mark_package_stale(&self, package: &str, target: Option<&str>) -> Result<u64, Error> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE package_builds SET state = 'stale', updated_at = now()
+                 WHERE package = $1 AND state IN ('published', 'failed')
+                   AND ($2::text IS NULL OR target = $2)",
+                &[package.into(), target.into()],
+            )
         })
     }
 
