@@ -22,16 +22,24 @@
 //! rebuilds: a package waits for its dependencies, and when one of them
 //! is published again, with a new rebuild counter, the package is no
 //! longer up to date.
+//!
+//! A step first publishes every build that finished since the last one,
+//! on every target, then writes the index of each repository that
+//! changed, once, and only then queues builds. Writing an index costs
+//! as much as the repository is large, so it is not done per build; and
+//! a build is queued only when the index lists what it depends on.
 
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::time::Instant;
 
 use ci_http::server::{Request, Response};
 use ci_json::Value;
 use ci_protocol::Outcome;
 
 use super::{json_ok, read_json, reject, str_field, Coordinator, Reject};
-use crate::db::{Intake, JobStatus, PackageBuild};
+use crate::db::{ArchivedRelease, Intake, JobStatus, PackageBuild};
 use crate::gitrefs;
 
 /// Where a job runs.
@@ -229,6 +237,9 @@ fn job_with(job: &Value, parameters: Vec<(&str, Value)>, inputs: Option<Value>) 
 struct Wanted {
     repository: String,
     version: String,
+    /// Where its release came from, as the archive recorded it.
+    url: String,
+    tag: String,
     /// The hash of the archived tarball of its release.
     sha256: String,
     /// The packages it depends on, of those that are wanted too.
@@ -284,6 +295,29 @@ fn inputs_of(wanted: &Wanted, published: &BTreeMap<String, (String, i64)>) -> Op
 /// The packages the rosdistro says should exist, by name.
 type WantedPackages = BTreeMap<String, Wanted>;
 
+/// What a step did, for one line in the log.
+#[derive(Default)]
+struct Done {
+    published: usize,
+    failed: usize,
+    indexes: usize,
+    queued: usize,
+}
+
+/// Where a target's packages stand in the middle of a step: after its
+/// finished builds were published, before anything is queued.
+struct Progress {
+    /// The packages, each with what it waits for on this target.
+    wanted: WantedPackages,
+    order: Vec<String>,
+    stuck: Vec<String>,
+    rows: BTreeMap<String, PackageBuild>,
+    /// The published build of each package: its version and counter.
+    published: BTreeMap<String, (String, i64)>,
+    /// The packages whose build is still queued or running.
+    unfinished: BTreeSet<String>,
+}
+
 impl Coordinator {
     fn reconciler_config(&self) -> Result<Option<Config>, String> {
         let Some(stored) = self.db.reconciler_config().map_err(|e| e.to_string())? else {
@@ -306,8 +340,48 @@ impl Coordinator {
         let Some((commit, wanted)) = self.wanted_packages(&config)? else {
             return Ok(());
         };
+        // The same for every job of this step, so it is made once, and
+        // only if a job is queued.
+        let distribution = OnceCell::new();
+        let mut done = Done::default();
+        // First every target's finished builds are published, then each
+        // repository's index is written once, and only then is anything
+        // queued: a build is queued when the index lists what it
+        // depends on.
+        let started = Instant::now();
+        let mut progress = Vec::new();
         for target in &config.targets {
-            self.target_step(&config, target, &commit, &wanted)?;
+            progress.push(self.finished_builds(&config, target, &wanted, &mut done)?);
+        }
+        let published = Instant::now();
+        let repositories: BTreeSet<&str> = config
+            .targets
+            .iter()
+            .map(|target| target.repository.as_str())
+            .collect();
+        for repository in repositories {
+            let written = self
+                .write_stale_index(repository)
+                .map_err(|Reject(_, message)| {
+                    format!("writing the index of {repository}: {message}")
+                })?;
+            done.indexes += usize::from(written);
+        }
+        let indexed = Instant::now();
+        for (target, progress) in config.targets.iter().zip(progress) {
+            self.queue_builds(&config, target, &commit, progress, &distribution, &mut done)?;
+        }
+        if done.published + done.failed + done.queued > 0 {
+            eprintln!(
+                "reconciler: step: published {} builds in {} ms, {} failed, wrote {} indexes in {} ms, queued {} builds in {} ms",
+                done.published,
+                (published - started).as_millis(),
+                done.failed,
+                done.indexes,
+                (indexed - published).as_millis(),
+                done.queued,
+                indexed.elapsed().as_millis(),
+            );
         }
         Ok(())
     }
@@ -547,13 +621,24 @@ impl Coordinator {
         let detail = ci_json::parse(&intake.detail).map_err(|e| e.to_string())?;
         let mut wanted = BTreeMap::new();
         let mut keys: BTreeMap<String, (Vec<String>, Vec<String>)> = BTreeMap::new();
-        for release in list(&detail, "releases") {
-            let (repository, version) = (word(release, "repository"), word(release, "version"));
-            let Some(archived) = self
-                .db
-                .archived_release(&config.rosdistro, repository, version)
-                .map_err(|e| e.to_string())?
-            else {
+        let releases: Vec<(&str, &str)> = list(&detail, "releases")
+            .iter()
+            .map(|release| (word(release, "repository"), word(release, "version")))
+            .collect();
+        let archive: BTreeMap<(String, String), ArchivedRelease> = self
+            .db
+            .archived_releases_of(&config.rosdistro, &releases)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|release| {
+                (
+                    (release.repository.clone(), release.version.clone()),
+                    release,
+                )
+            })
+            .collect();
+        for (repository, version) in releases {
+            let Some(archived) = archive.get(&(repository.to_string(), version.to_string())) else {
                 return Err(format!(
                     "{repository} {version} is not in the source archive"
                 ));
@@ -573,6 +658,8 @@ impl Coordinator {
                     Wanted {
                         repository: repository.to_string(),
                         version: version.to_string(),
+                        url: word(&record, "url").to_string(),
+                        tag: word(&record, "tag").to_string(),
                         sha256: archived.sha256.clone(),
                         depends: Vec::new(),
                         test_depends: Vec::new(),
@@ -603,13 +690,16 @@ impl Coordinator {
     // Builds
     // -----------------------------------------------------------------
 
-    fn target_step(
+    /// The first half of a target's step: sees how far each queued build
+    /// has come and publishes those that are done, without writing the
+    /// index.
+    fn finished_builds(
         &self,
         config: &Config,
         target: &Target,
-        commit: &str,
         wanted: &BTreeMap<String, Wanted>,
-    ) -> Result<(), String> {
+        done: &mut Done,
+    ) -> Result<Progress, String> {
         let err = |e: ci_postgres::Error| e.to_string();
         // What a package waits for depends on whether its tests run.
         let wanted: WantedPackages = wanted
@@ -625,7 +715,6 @@ impl Coordinator {
                 (name.clone(), package)
             })
             .collect();
-        let wanted = &wanted;
         let mut published: BTreeMap<String, (String, i64)> = self
             .db
             .repository_builds(&target.repository)
@@ -634,7 +723,7 @@ impl Coordinator {
             .filter(|build| build.arch == target.place.arch)
             .map(|build| (build.package, (build.version, build.revision)))
             .collect();
-        let rows: BTreeMap<String, PackageBuild> = self
+        let mut rows: BTreeMap<String, PackageBuild> = self
             .db
             .package_builds(&target.name)
             .map_err(err)?
@@ -648,44 +737,39 @@ impl Coordinator {
                 .forget_package_build(&target.name, name)
                 .map_err(err)?;
         }
-        let (order, stuck) = build_order(wanted);
-        let mut up_to_date = BTreeSet::new();
+        let (order, stuck) = build_order(&wanted);
 
+        // The builds that were queued: see how far each has come,
+        // and publish those that are done.
+        let building: Vec<i64> = rows
+            .values()
+            .filter(|row| row.state == "building")
+            .filter_map(|row| row.job_id)
+            .collect();
+        let states = self.db.job_states(&building).map_err(err)?;
+        let mut unfinished = BTreeSet::new();
+        let mut later = Vec::new();
         for name in &order {
-            let package = &wanted[name];
-            let before = rows.get(name);
-            let mut row = before.cloned().unwrap_or_else(|| PackageBuild {
-                package: name.clone(),
-                state: "none".to_string(),
-                status: String::new(),
-                inputs: String::new(),
-                version: String::new(),
-                revision: 0,
-                job_id: None,
-                attempts: 0,
-                retry_due: true,
-                next_retry_at: None,
-                message: String::new(),
-            });
+            let Some(before) = rows.get(name).filter(|row| row.state == "building") else {
+                continue;
+            };
+            let mut row = before.clone();
             let mut retry_in = None;
-
-            // A build that was queued: see how far it has come.
-            if row.state == "building" {
-                let job = match row.job_id {
+            let state = row.job_id.and_then(|id| states.get(&id));
+            if let Some(state) = state.filter(|state| *state != "finished") {
+                row.status = if state == "queued" {
+                    "queued"
+                } else {
+                    "building"
+                }
+                .to_string();
+                unfinished.insert(name.clone());
+            } else {
+                let job = match row.job_id.filter(|_| state.is_some()) {
                     Some(id) => self.db.job_status(id).map_err(err)?,
                     None => None,
                 };
                 match job {
-                    Some(job) if job.state != "finished" => {
-                        row.status = if job.state == "queued" {
-                            "queued"
-                        } else {
-                            "building"
-                        }
-                        .to_string();
-                        self.save_build(target, before, &row, None)?;
-                        continue;
-                    }
                     Some(job) if job.outcome.as_deref() == Some(Outcome::Success.as_str()) => {
                         let body = Value::object([
                             ("job_id", Value::Int(job.id)),
@@ -702,11 +786,14 @@ impl Coordinator {
                                 ),
                             ),
                         ]);
-                        match self.publish_build("reconciler", &target.repository, &body) {
+                        let result =
+                            self.publish_without_index("reconciler", &target.repository, &body);
+                        match result {
                             Ok(_) => {
                                 row.state = "published".to_string();
                                 row.message.clear();
                                 published.insert(name.clone(), (row.version.clone(), row.revision));
+                                done.published += 1;
                             }
                             // Something of the coordinator's own went
                             // wrong. The build is fine; try again later.
@@ -748,12 +835,74 @@ impl Coordinator {
                     let doublings = (row.attempts - 1).clamp(0, 16) as u32;
                     retry_in = Some(config.retry_backoff_seconds << doublings);
                     row.retry_due = false;
+                    done.failed += 1;
                     eprintln!(
                         "reconciler: {}: {name} failed, attempt {}: {}",
                         target.name, row.attempts, row.message
                     );
                 }
             }
+            self.save_build(target, Some(before), &row, retry_in, &mut later)?;
+            rows.insert(name.clone(), row);
+        }
+
+        self.db
+            .save_package_statuses(&target.name, &later)
+            .map_err(err)?;
+        Ok(Progress {
+            wanted,
+            order,
+            stuck,
+            rows,
+            published,
+            unfinished,
+        })
+    }
+
+    /// The second half of a target's step, after the index is written:
+    /// decides what each package needs and queues the builds that can
+    /// start.
+    fn queue_builds(
+        &self,
+        config: &Config,
+        target: &Target,
+        commit: &str,
+        progress: Progress,
+        distribution: &OnceCell<Value>,
+        done: &mut Done,
+    ) -> Result<(), String> {
+        let err = |e: ci_postgres::Error| e.to_string();
+        let Progress {
+            wanted,
+            order,
+            stuck,
+            rows,
+            published,
+            unfinished,
+        } = progress;
+        let wanted = &wanted;
+        let mut up_to_date = BTreeSet::new();
+        let mut later = Vec::new();
+        for name in &order {
+            if unfinished.contains(name) {
+                continue;
+            }
+            let package = &wanted[name];
+            let before = rows.get(name);
+            let mut row = before.cloned().unwrap_or_else(|| PackageBuild {
+                package: name.clone(),
+                state: "none".to_string(),
+                status: String::new(),
+                inputs: String::new(),
+                version: String::new(),
+                revision: 0,
+                job_id: None,
+                attempts: 0,
+                retry_due: true,
+                next_retry_at: None,
+                message: String::new(),
+            });
+            let retry_in = None;
 
             // Then decide what the package needs.
             let dependencies_ready = package.depends.iter().all(|dep| up_to_date.contains(dep));
@@ -764,14 +913,14 @@ impl Coordinator {
             };
             let Some(inputs) = inputs else {
                 row.status = "blocked".to_string();
-                self.save_build(target, before, &row, retry_in)?;
+                self.save_build(target, before, &row, retry_in, &mut later)?;
                 continue;
             };
             let same = row.inputs == inputs;
             if row.state == "published" && same {
                 row.status = "up_to_date".to_string();
                 up_to_date.insert(name.clone());
-                self.save_build(target, before, &row, retry_in)?;
+                self.save_build(target, before, &row, retry_in, &mut later)?;
                 continue;
             }
             if row.state == "failed" && same {
@@ -780,7 +929,7 @@ impl Coordinator {
                 // a dependency changes, which changes the inputs.
                 if row.attempts > config.build_retries || !row.retry_due {
                     row.status = "failed".to_string();
-                    self.save_build(target, before, &row, retry_in)?;
+                    self.save_build(target, before, &row, retry_in, &mut later)?;
                     continue;
                 }
             } else {
@@ -792,8 +941,15 @@ impl Coordinator {
                 .db
                 .allocate_revision(&target.repository, name, &package.version)
                 .map_err(err)?;
-            let description =
-                self.build_description(config, target, commit, wanted, name, revision)?;
+            let description = self.build_description(
+                config,
+                target,
+                commit,
+                wanted,
+                distribution,
+                name,
+                revision,
+            )?;
             let job_id = self.submit_internal(&target.place, &description)?;
             row.state = "building".to_string();
             row.status = "queued".to_string();
@@ -802,11 +958,12 @@ impl Coordinator {
             row.revision = revision;
             row.job_id = Some(job_id);
             row.message.clear();
+            done.queued += 1;
             eprintln!(
                 "reconciler: {}: queued {name} {} revision {revision} as job {job_id}",
                 target.name, package.version
             );
-            self.save_build(target, before, &row, None)?;
+            self.save_build(target, before, &row, None, &mut later)?;
         }
 
         for name in &stuck {
@@ -826,20 +983,43 @@ impl Coordinator {
             });
             row.status = "blocked".to_string();
             row.message = "it is part of a dependency cycle, or depends on one".to_string();
-            self.save_build(target, before, &row, None)?;
+            self.save_build(target, before, &row, None, &mut later)?;
         }
+        self.db
+            .save_package_statuses(&target.name, &later)
+            .map_err(err)?;
         Ok(())
     }
 
-    /// Writes a package's row if anything in it changed.
+    /// Writes a package's row if anything in it changed. A change in
+    /// nothing but how the package is shown, such as from blocked to up
+    /// to date, is put on `later` instead, to be written with the others
+    /// of its kind in one transaction: a large rebuild makes thousands
+    /// of them in a step, and they follow from the rest, so one that is
+    /// lost with a crash is made again by the next step.
     fn save_build(
         &self,
         target: &Target,
         before: Option<&PackageBuild>,
         row: &PackageBuild,
         retry_in: Option<i64>,
+        later: &mut Vec<PackageBuild>,
     ) -> Result<(), String> {
         if before == Some(row) && retry_in.is_none() {
+            return Ok(());
+        }
+        let shown_only = retry_in.is_none()
+            && match before {
+                Some(before) => {
+                    let mut same = before.clone();
+                    same.status.clone_from(&row.status);
+                    same.message.clone_from(&row.message);
+                    same == *row
+                }
+                None => row.state == "none",
+            };
+        if shown_only {
+            later.push(row.clone());
             return Ok(());
         }
         self.db
@@ -847,55 +1027,56 @@ impl Coordinator {
             .map_err(|e| e.to_string())
     }
 
+    /// The releases of the distribution, with their packages: what
+    /// rosdep is given as the distribution file.
+    fn distribution(wanted: &WantedPackages) -> Value {
+        let mut releases: BTreeMap<&str, (&Wanted, Vec<&str>)> = BTreeMap::new();
+        let mut groups: BTreeMap<&str, Vec<(String, Value)>> = BTreeMap::new();
+        for (name, package) in wanted {
+            releases
+                .entry(&package.repository)
+                .or_insert((package, Vec::new()))
+                .1
+                .push(name);
+            if !package.groups.is_empty() {
+                groups
+                    .entry(&package.repository)
+                    .or_default()
+                    .push((name.clone(), Value::strings(&package.groups)));
+            }
+        }
+        Value::Array(
+            releases
+                .into_iter()
+                .map(|(repository, (release, packages))| {
+                    Value::object([
+                        ("repository", Value::from(repository)),
+                        ("url", Value::from(release.url.as_str())),
+                        ("version", Value::from(release.version.as_str())),
+                        ("tag", Value::from(release.tag.as_str())),
+                        ("packages", Value::strings(packages)),
+                        (
+                            "groups",
+                            Value::Object(groups.remove(repository).unwrap_or_default()),
+                        ),
+                    ])
+                })
+                .collect(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn build_description(
         &self,
         config: &Config,
         target: &Target,
         commit: &str,
         wanted: &BTreeMap<String, Wanted>,
+        distribution: &OnceCell<Value>,
         package: &str,
         revision: i64,
     ) -> Result<Value, String> {
-        // The releases of the distribution, with their packages: what
-        // rosdep is given as the distribution file.
-        let mut releases: BTreeMap<&str, (Value, Vec<&str>)> = BTreeMap::new();
-        let mut groups: BTreeMap<&str, Vec<(String, Value)>> = BTreeMap::new();
-        for (name, other) in wanted {
-            if !releases.contains_key(other.repository.as_str()) {
-                let archived = self
-                    .db
-                    .archived_release(&config.rosdistro, &other.repository, &other.version)
-                    .map_err(|e| e.to_string())?
-                    .ok_or("a release left the source archive")?;
-                let record = ci_json::parse(&archived.record).map_err(|e| e.to_string())?;
-                releases.insert(&other.repository, (record, Vec::new()));
-            }
-            if let Some((_, packages)) = releases.get_mut(other.repository.as_str()) {
-                packages.push(name);
-            }
-            if !other.groups.is_empty() {
-                groups
-                    .entry(&other.repository)
-                    .or_default()
-                    .push((name.clone(), Value::strings(&other.groups)));
-            }
-        }
-        let distribution = releases
-            .into_iter()
-            .map(|(repository, (record, packages))| {
-                Value::object([
-                    ("repository", Value::from(repository)),
-                    ("url", Value::from(word(&record, "url"))),
-                    ("version", Value::from(word(&record, "version"))),
-                    ("tag", Value::from(word(&record, "tag"))),
-                    ("packages", Value::strings(packages)),
-                    (
-                        "groups",
-                        Value::Object(groups.remove(repository).unwrap_or_default()),
-                    ),
-                ])
-            })
-            .collect();
+        let distribution = distribution.get_or_init(|| Self::distribution(wanted));
         let key = self
             .signing_key
             .as_ref()
@@ -906,7 +1087,7 @@ impl Coordinator {
             ("rosdistro", Value::from(config.rosdistro.as_str())),
             ("rosdistro_url", Value::from(config.rosdistro_url(commit))),
             ("revision", Value::Int(revision)),
-            ("distribution", Value::Array(distribution)),
+            ("distribution", distribution.clone()),
             (
                 "repositories",
                 Value::Array(vec![Value::object([
@@ -1043,6 +1224,13 @@ impl Coordinator {
             ("rosdistro", Value::from(config.rosdistro)),
             ("intake", intake),
             ("built_from_commit", built_from),
+            (
+                "last_step_milliseconds",
+                Value::Int(
+                    self.reconcile_millis
+                        .load(std::sync::atomic::Ordering::Relaxed) as i64,
+                ),
+            ),
             ("targets", Value::Array(targets)),
         ])))
     }
@@ -1085,6 +1273,8 @@ mod tests {
         Wanted {
             repository: "repo".to_string(),
             version: version.to_string(),
+            url: String::new(),
+            tag: String::new(),
             sha256: "0".repeat(64),
             depends: depends.iter().map(|d| d.to_string()).collect(),
             test_depends: Vec::new(),

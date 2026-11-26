@@ -121,6 +121,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ci_scale"
+version = "0.1.0"
+dependencies = [
+ "ci_crypto",
+ "ci_http",
+ "ci_json",
+ "ci_net",
+]
+
+[[package]]
 name = "ci_tar"
 version = "0.1.0"
 

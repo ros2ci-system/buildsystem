@@ -32,6 +32,7 @@ is connected to the ROS build farm or to any official ROS infrastructure.**
 | `crates/agent` | The worker agent, `ci-agent` |
 | `crates/admin` | The administrator's tool, `ci-admin` |
 | `crates/e2e` | End-to-end tests of all of the above together |
+| `crates/scale` | The scale test's tool, `ci-scale`: a made-up ROS distribution and stand-in workers whose jobs finish at once |
 
 ## Running it
 
@@ -225,6 +226,19 @@ ci-admin publish --repository rolling-resolute --job 7 --package ament_package \
   (for dnf: `repo_gpgcheck=1`, `gpgcheck=0`).
 - **Nothing is compressed.** There is no compressor in this code. apt
   and dnf both read the plain index files.
+- **The index is written after the change, not as part of it.** A
+  publish puts the files in place and records the build; the repository
+  is then marked, and its index is written from the database: at once by
+  `ci-admin publish`, and once a step by the reconciler, for however many
+  builds it published. Writing an index costs as much as the repository
+  is large. The files a build replaced are removed after the new index
+  is in place. A coordinator that stopped in between writes the index
+  when it starts.
+- **Old index files.** The parts of the index are named by their hash, so
+  a client that read the top a moment before a change still finds what
+  it names. Superseded parts are kept for an hour, and at most twelve of
+  them in a directory, the newest; a large rebuild would otherwise leave
+  a copy of the whole index for each of its steps.
 
 ### Releases and the source archive
 
@@ -279,6 +293,13 @@ ci-admin rebuild --package rcutils
   building, blocked or failed. A failed build is tried again a set number
   of times, with a delay that doubles; after that it stays failed until
   its source or a dependency changes, or someone asks for a rebuild.
+- **A step publishes, then writes the indexes, then queues.** Every
+  build that finished since the last step is published, on every target;
+  then the index of each repository that changed is written, once; then
+  builds are queued. So a build is queued only when the index lists what
+  it depends on. A line in the log says what each step did and how long
+  each part took, and `reconcile-status --json` has the time of the last
+  step.
 - **Nothing is kept in memory.** Every step reads where things stand from
   the database and writes down what it did. A restart, or a worker that
   dies with a job, delays builds and loses none.
@@ -319,6 +340,63 @@ cargo test --workspace
 ```
 
 The build comes first because the end-to-end tests run the built programs.
+
+### The scale test
+
+`ci-scale` makes up a ROS distribution and stands in for everything
+outside the coordinator: the rosdistro's git server, and workers that
+answer each job at once with what it would have left behind. What is left
+to measure is the coordinator, the reconciler and the database.
+
+```
+ci-scale generate --packages 2000 --output distribution.json
+ci-scale run --distribution distribution.json --coordinator http://127.0.0.1:8443 \
+    --git-listen 127.0.0.1:8446 \
+    --workers linux:amd64:2:pull-request-token --workers linux:amd64:60:release-token \
+    --workers linux:arm64:40:release-token
+ci-admin reconcile-config settings.json        # the full build starts
+ci-scale bump distribution.json --package pkg_00000 --rebuilt expected.txt
+                                               # a release of the lowest package
+```
+
+The generated distribution has the shape of Rolling as its rosdistro
+cache had it on 2026-11-26 (1,600 packages, 642 repositories, 6.5
+dependencies a package, a longest dependency chain of 42, 91% of the
+packages standing on the lowest one), scaled to the number of packages
+asked for. The reconciler's settings name the git server as the
+rosdistro's repository, and each target's job carries a `scale`
+parameter that says what to pretend to build;
+`crates/scale/example-settings.json` is the settings the measurements
+below were made with, for repositories named `scale-resolute`,
+`scale-trixie` and `scale-el10`.
+
+Measured on 2026-11-26 with 2,000 packages in 690 repositories on 5
+targets (three apt, two RPM, in three repositories), 100 stand-in
+workers, and the coordinator and PostgreSQL 17 together on one machine
+with 4 cores and 8 GB of memory:
+
+| | Full build from nothing | New version of the lowest package |
+|---|---|---|
+| Builds | 10,000 | 9,605, which is every build that depends on it and no other |
+| Time | 9 min 45 s | 9 min 30 s |
+| Coordinator | 88 s of processor time, 189 MB at its largest | 90 s, 199 MB |
+| PostgreSQL | 107 s of processor time, 396,000 transactions | 106 s, 368,000 transactions |
+| Database size | 9 MB to 245 MB | 246 MB to 442 MB |
+| Longest step of the reconciler | 32 s, to queue 960 builds | 33 s |
+
+In both, every build was queued only after the builds it depends on
+were published and listed in the index. The time is the reconciler's:
+the dependency chain is 42 packages long, each link needs a step, and a
+step that queues hundreds of builds waits its turn at the database
+behind the stand-in workers, which all answer at once as real ones do
+not. With nothing to do, a step takes 0.2 s.
+
+What the database grows by is the jobs: each build job carries the list
+of the distribution's 690 releases, about 110 kB, which the database
+stores in about 16 kB. Nothing removes old jobs yet.
+
+About 2% of the stand-in workers' calls found the coordinator's
+connection queue full, were closed, and were made again. None was lost.
 
 ### What has been tested where
 

@@ -7,6 +7,7 @@
 //! All state lives here. The coordinator process keeps nothing in memory
 //! that it could not read back, so a restart loses nothing.
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use ci_postgres::{Config, Connection, Error, Param, Row};
@@ -177,6 +178,17 @@ const MIGRATIONS: &[&str] = &[
         updated_at timestamptz NOT NULL DEFAULT now(),
         PRIMARY KEY (target, package)
     );",
+    // 8: a repository's index is written after its contents change, not
+    // as part of the change, so that many builds can be published before
+    // it is written once. Until then the repository is marked, and the
+    // files the change replaced wait here to be removed.
+    "ALTER TABLE repositories ADD COLUMN index_stale boolean NOT NULL DEFAULT false;
+    CREATE TABLE repository_garbage (
+        repository text NOT NULL REFERENCES repositories (name),
+        path text NOT NULL,
+        PRIMARY KEY (repository, path)
+    );
+    CREATE INDEX repository_files_build ON repository_files (repository, package, arch);",
 ];
 
 const TIMESTAMP: &str = "'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'";
@@ -520,23 +532,38 @@ impl Db {
                 &[repository.into()],
             )?
             .iter()
-            .map(|row| {
-                Ok(PublishedBuild {
-                    package: row.text(0)?.to_string(),
-                    arch: row.text(1)?.to_string(),
-                    version: row.text(2)?.to_string(),
-                    revision: row.int(3)?,
-                    job_id: row.int(4)?,
-                    attempt: row.int(5)?,
-                    published_at: row.text(6)?.to_string(),
-                })
-            })
+            .map(published_build_from_row)
             .collect()
         })
     }
 
+    /// The published build of a package for an architecture, if any.
+    pub fn repository_build(
+        &self,
+        repository: &str,
+        package: &str,
+        arch: &str,
+    ) -> Result<Option<PublishedBuild>, Error> {
+        self.with(|c| {
+            c.query(
+                &format!(
+                    "SELECT package, arch, version, revision, job_id, attempt,
+                            to_char(published_at AT TIME ZONE 'UTC', {TIMESTAMP})
+                     FROM repository_builds
+                     WHERE repository = $1 AND package = $2 AND arch = $3"
+                ),
+                &[repository.into(), package.into(), arch.into()],
+            )?
+            .first()
+            .map(published_build_from_row)
+            .transpose()
+        })
+    }
+
     /// Makes a build the published one for its package and architecture,
-    /// in one transaction. Returns the paths of the files it replaced.
+    /// in one transaction. The repository's index is then out of date,
+    /// and the files of the build it replaced wait to be removed, both
+    /// until [`Db::index_written`].
     #[allow(clippy::too_many_arguments)]
     pub fn replace_repository_build(
         &self,
@@ -548,18 +575,21 @@ impl Db {
         job_id: i64,
         attempt: i64,
         files: &[Planned],
-    ) -> Result<Vec<String>, Error> {
+    ) -> Result<(), Error> {
         self.with(|c| {
             c.transaction(|c| {
-                let replaced = c
-                    .query(
-                        "DELETE FROM repository_files
-                         WHERE repository = $1 AND package = $2 AND arch = $3 RETURNING path",
-                        &[repository.into(), package.into(), arch.into()],
-                    )?
-                    .iter()
-                    .map(|row| row.text(0).map(str::to_string))
-                    .collect::<Result<Vec<_>, _>>()?;
+                c.execute(
+                    "INSERT INTO repository_garbage (repository, path)
+                     SELECT repository, path FROM repository_files
+                     WHERE repository = $1 AND package = $2 AND arch = $3
+                     ON CONFLICT DO NOTHING",
+                    &[repository.into(), package.into(), arch.into()],
+                )?;
+                c.execute(
+                    "DELETE FROM repository_files
+                     WHERE repository = $1 AND package = $2 AND arch = $3",
+                    &[repository.into(), package.into(), arch.into()],
+                )?;
                 for file in files {
                     c.execute(
                         "INSERT INTO repository_files
@@ -575,6 +605,11 @@ impl Db {
                             (&file.sha256).into(),
                             (&file.metadata).into(),
                         ],
+                    )?;
+                    // A path that is in use again is not to be removed.
+                    c.execute(
+                        "DELETE FROM repository_garbage WHERE repository = $1 AND path = $2",
+                        &[repository.into(), (&file.path).into()],
                     )?;
                 }
                 c.execute(
@@ -595,7 +630,69 @@ impl Db {
                         attempt.into(),
                     ],
                 )?;
-                Ok(replaced)
+                c.execute(
+                    "UPDATE repositories SET index_stale = true WHERE name = $1",
+                    &[repository.into()],
+                )?;
+                Ok(())
+            })
+        })
+    }
+
+    /// Whether a repository's contents changed since its index was
+    /// last written.
+    pub fn index_stale(&self, repository: &str) -> Result<bool, Error> {
+        self.with(|c| {
+            Ok(!c
+                .query(
+                    "SELECT 1 FROM repositories WHERE name = $1 AND index_stale",
+                    &[repository.into()],
+                )?
+                .is_empty())
+        })
+    }
+
+    /// The repositories whose index is out of date.
+    pub fn stale_repositories(&self) -> Result<Vec<String>, Error> {
+        self.with(|c| {
+            c.query(
+                "SELECT name FROM repositories WHERE index_stale ORDER BY name",
+                &[],
+            )?
+            .iter()
+            .map(|row| row.text(0).map(str::to_string))
+            .collect()
+        })
+    }
+
+    /// The files of a repository that nothing lists any more.
+    pub fn repository_garbage(&self, repository: &str) -> Result<Vec<String>, Error> {
+        self.with(|c| {
+            c.query(
+                "SELECT path FROM repository_garbage WHERE repository = $1",
+                &[repository.into()],
+            )?
+            .iter()
+            .map(|row| row.text(0).map(str::to_string))
+            .collect()
+        })
+    }
+
+    /// Records that a repository's index was written from its present
+    /// contents and that the files nothing lists were removed. The
+    /// caller holds the lock on publishing, so nothing changed between.
+    pub fn index_written(&self, repository: &str) -> Result<(), Error> {
+        self.with(|c| {
+            c.transaction(|c| {
+                c.execute(
+                    "DELETE FROM repository_garbage WHERE repository = $1",
+                    &[repository.into()],
+                )?;
+                c.execute(
+                    "UPDATE repositories SET index_stale = false WHERE name = $1",
+                    &[repository.into()],
+                )?;
+                Ok(())
             })
         })
     }
@@ -666,6 +763,40 @@ impl Db {
             .first()
             .map(archived_release_from_row)
             .transpose()
+        })
+    }
+
+    /// The archived releases of a ROS distribution among those named,
+    /// each as a repository and a version, in one query.
+    pub fn archived_releases_of(
+        &self,
+        rosdistro: &str,
+        releases: &[(&str, &str)],
+    ) -> Result<Vec<ArchivedRelease>, Error> {
+        let named = ci_json::Value::Array(
+            releases
+                .iter()
+                .map(|(repository, version)| {
+                    ci_json::Value::object([
+                        ("repository", ci_json::Value::from(*repository)),
+                        ("version", ci_json::Value::from(*version)),
+                    ])
+                })
+                .collect(),
+        )
+        .to_json();
+        self.with(|c| {
+            c.query(
+                "SELECT a.rosdistro, a.repository, a.version, a.commit_id, a.sha256, a.record
+                 FROM source_archive a
+                 JOIN jsonb_to_recordset($2::jsonb) AS named (repository text, version text)
+                   ON a.repository = named.repository AND a.version = named.version
+                 WHERE a.rosdistro = $1",
+                &[rosdistro.into(), named.as_str().into()],
+            )?
+            .iter()
+            .map(archived_release_from_row)
+            .collect()
         })
     }
 
@@ -878,6 +1009,47 @@ impl Db {
                 ],
             )
             .map(|_| ())
+        })
+    }
+
+    /// Writes how many packages are shown, in one transaction: of a
+    /// record that exists, only its status and message change, so that
+    /// nothing else written meanwhile is undone.
+    pub fn save_package_statuses(
+        &self,
+        target: &str,
+        builds: &[PackageBuild],
+    ) -> Result<(), Error> {
+        if builds.is_empty() {
+            return Ok(());
+        }
+        self.with(|c| {
+            c.transaction(|c| {
+                for build in builds {
+                    c.execute(
+                        "INSERT INTO package_builds
+                             (target, package, state, status, inputs, version, revision, job_id,
+                              attempts, message)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                         ON CONFLICT (target, package) DO UPDATE
+                         SET status = excluded.status, message = excluded.message,
+                             updated_at = now()",
+                        &[
+                            target.into(),
+                            (&build.package).into(),
+                            (&build.state).into(),
+                            (&build.status).into(),
+                            (&build.inputs).into(),
+                            (&build.version).into(),
+                            build.revision.into(),
+                            build.job_id.into(),
+                            build.attempts.into(),
+                            (&build.message).into(),
+                        ],
+                    )?;
+                }
+                Ok(())
+            })
         })
     }
 
@@ -1226,6 +1398,28 @@ impl Db {
         })
     }
 
+    /// The state of each of the jobs named that exists: `queued`,
+    /// `running` or `finished`. One query, however many jobs.
+    pub fn job_states(&self, job_ids: &[i64]) -> Result<BTreeMap<i64, String>, Error> {
+        if job_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let list = job_ids
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        self.with(|c| {
+            c.query(
+                "SELECT id, state FROM jobs WHERE id = ANY (string_to_array($1, ',')::bigint[])",
+                &[list.as_str().into()],
+            )?
+            .iter()
+            .map(|row| Ok((row.int(0)?, row.text(1)?.to_string())))
+            .collect()
+        })
+    }
+
     pub fn job_status(&self, job_id: i64) -> Result<Option<JobStatus>, Error> {
         self.with(|c| {
             let rows = c.query(
@@ -1437,6 +1631,18 @@ fn artifact_from_row(row: &Row) -> Result<Artifact, Error> {
         path: row.text(0)?.to_string(),
         size: row.int(1)?,
         sha256: row.text(2)?.to_string(),
+    })
+}
+
+fn published_build_from_row(row: &Row) -> Result<PublishedBuild, Error> {
+    Ok(PublishedBuild {
+        package: row.text(0)?.to_string(),
+        arch: row.text(1)?.to_string(),
+        version: row.text(2)?.to_string(),
+        revision: row.int(3)?,
+        job_id: row.int(4)?,
+        attempt: row.int(5)?,
+        published_at: row.text(6)?.to_string(),
     })
 }
 

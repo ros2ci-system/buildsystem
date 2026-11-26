@@ -23,7 +23,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ci_crypto::{hex_encode, sha256};
 use ci_json::Value;
@@ -626,6 +626,11 @@ fn plan_rpm(
 /// clients that fetched the top of the index a moment before it changed.
 const KEEP_OLD_INDEX: Duration = Duration::from_secs(3600);
 
+/// And no more of them than this many in one directory, the newest. A
+/// large rebuild writes the index every few seconds for hours, and each
+/// copy is as large as the whole index.
+const KEEP_OLD_INDEXES: usize = 12;
+
 /// Writes a file under a temporary name and renames it, so that nobody
 /// reads half of it.
 fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
@@ -639,24 +644,45 @@ fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     fs::rename(&temporary, path)
 }
 
-/// Removes the files in `dir` that are not in `keep` and are old.
+/// Removes the files in `dir` that are not in `keep` and are old, or
+/// are more than the number of old ones kept.
 fn prune(dir: &Path, keep: &HashSet<String>) -> io::Result<()> {
+    let mut old = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if keep.contains(&name) || !entry.file_type()?.is_file() {
+        // A name with a dot in front is a file being written.
+        if keep.contains(&name) || name.starts_with('.') || !entry.file_type()?.is_file() {
             continue;
         }
-        let age = entry
-            .metadata()?
-            .modified()
-            .ok()
-            .and_then(|modified| SystemTime::now().duration_since(modified).ok());
-        if age.is_some_and(|age| age > KEEP_OLD_INDEX) {
-            fs::remove_file(entry.path())?;
+        let modified = entry.metadata()?.modified().unwrap_or(UNIX_EPOCH);
+        old.push((modified, entry.path()));
+    }
+    old.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    let now = SystemTime::now();
+    for (index, (modified, path)) in old.iter().enumerate() {
+        let aged = now
+            .duration_since(*modified)
+            .is_ok_and(|age| age > KEEP_OLD_INDEX);
+        if aged || index >= KEEP_OLD_INDEXES {
+            fs::remove_file(path)?;
         }
     }
     Ok(())
+}
+
+/// Writes an index file whose name is the hash of its contents, unless
+/// it is there already: a part of the index that did not change is not
+/// written again. One that was superseded and is current again counts
+/// as new from now.
+fn write_named_by_hash(path: &Path, contents: &[u8]) -> io::Result<()> {
+    if path.is_file() {
+        return fs::OpenOptions::new()
+            .write(true)
+            .open(path)?
+            .set_modified(SystemTime::now());
+    }
+    write_atomic(path, contents)
 }
 
 /// The entries of one section, in the order of their paths, so that the
@@ -728,8 +754,12 @@ fn write_apt_index(
         // The copy named by its hash is what apt fetches, so that an
         // index read during an update is never a mix of old and new.
         let by_hash = directory.join("by-hash").join("SHA256");
-        write_atomic(&by_hash.join(&hash), contents.as_bytes())?;
-        write_atomic(&directory.join(file_name), contents.as_bytes())?;
+        // A section that did not change is not written again.
+        let plain = directory.join(file_name);
+        if fs::read(&plain).ok().as_deref() != Some(contents.as_bytes()) {
+            write_atomic(&plain, contents.as_bytes())?;
+        }
+        write_named_by_hash(&by_hash.join(&hash), contents.as_bytes())?;
         prune(&by_hash, &HashSet::from([hash.clone()]))?;
         listing.push_str(&format!(
             " {hash} {} main/{section}/{file_name}\n",
@@ -840,7 +870,7 @@ fn write_rpm_index(
         contents.push_str(&format!("</{root}>\n"));
         let hash = hex_encode(&sha256(contents.as_bytes()));
         let name = format!("{hash}-{part}.xml");
-        write_atomic(&repodata.join(&name), contents.as_bytes())?;
+        write_named_by_hash(&repodata.join(&name), contents.as_bytes())?;
         repomd.push_str(&format!(
             "<data type=\"{part}\">\n\
              <checksum type=\"sha256\">{hash}</checksum>\n\
@@ -1189,5 +1219,71 @@ mod tests {
             assert!(rpm.join(empty).join("repodata/repomd.xml.asc").exists());
         }
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_unchanged_part_of_the_index_is_not_written_again() {
+        let root = std::env::temp_dir().join(format!("ros2ci-same-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let key = SigningKey::generate("Test <test@example.invalid>", 1_795_000_000).unwrap();
+        let planned = deb_plan("amd64", "ros-rolling-my-tool", "1.2.3-4resolute").unwrap();
+        let files: Vec<Stored> = planned
+            .iter()
+            .map(|p| Stored {
+                path: p.path.clone(),
+                section: p.section.clone(),
+                metadata: p.metadata.clone(),
+            })
+            .collect();
+        let repository = repository(Format::Apt);
+        write_index(&root, &repository, &files, &key, 1_795_694_400).unwrap();
+        let packages = root.join("dists/resolute/main/binary-amd64/Packages");
+        let release = root.join("dists/resolute/Release");
+        let first = fs::metadata(&packages).unwrap().modified().unwrap();
+        let first_release = fs::read_to_string(&release).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        write_index(&root, &repository, &files, &key, 1_795_694_460).unwrap();
+        // The section is the same file as before; the top of the index
+        // is new, with its new date.
+        assert_eq!(fs::metadata(&packages).unwrap().modified().unwrap(), first);
+        assert_ne!(fs::read_to_string(&release).unwrap(), first_release);
+        // A changed section is written.
+        write_index(&root, &repository, &[], &key, 1_795_694_520).unwrap();
+        let by_hash = root.join("dists/resolute/main/binary-amd64/by-hash/SHA256");
+        assert_eq!(fs::read_dir(&by_hash).unwrap().count(), 2);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn only_so_many_superseded_index_files_are_kept() {
+        let dir = std::env::temp_dir().join(format!("ros2ci-prune-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let now = SystemTime::now();
+        let extra = 5;
+        for index in 0..KEEP_OLD_INDEXES + extra {
+            let file = fs::File::create(dir.join(format!("old-{index:02}"))).unwrap();
+            // The higher the number, the older the file.
+            file.set_modified(now - Duration::from_secs(index as u64))
+                .unwrap();
+        }
+        let aged = fs::File::create(dir.join("aged")).unwrap();
+        aged.set_modified(now - KEEP_OLD_INDEX - Duration::from_secs(60))
+            .unwrap();
+        fs::write(dir.join("current"), "").unwrap();
+        fs::write(dir.join(".new-being-written"), "").unwrap();
+        prune(&dir, &HashSet::from(["current".to_string()])).unwrap();
+        let mut left: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        let mut expected: Vec<String> = (0..KEEP_OLD_INDEXES)
+            .map(|index| format!("old-{index:02}"))
+            .collect();
+        expected.insert(0, ".new-being-written".to_string());
+        expected.insert(1, "current".to_string());
+        assert_eq!(left, expected);
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

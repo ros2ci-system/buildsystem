@@ -103,16 +103,51 @@ impl Coordinator {
             .ok_or_else(|| reject(404, "no such repository"))
     }
 
-    /// Writes a repository's whole index from the database and signs it.
+    /// Writes a repository's whole index from the database and signs
+    /// it, and then removes the files that nothing lists any more. The
+    /// caller holds the lock on publishing.
     fn write_repository(&self, repository: &Repository) -> Result<(), Reject> {
         let files = self.db.repository_files(&repository.name)?;
+        let root = self.repository_root(&repository.name);
         repo::write_index(
-            &self.repository_root(&repository.name),
+            &root,
             repository,
             &files,
             self.signing_key()?,
             seconds_now(),
         )?;
+        // Only now: until the new index is in place, the old one still
+        // names these files.
+        for path in self.db.repository_garbage(&repository.name)? {
+            let _ = fs::remove_file(root.join(path));
+        }
+        self.db.index_written(&repository.name)?;
+        Ok(())
+    }
+
+    /// Writes the index of a repository if its contents changed since
+    /// the index was last written. Returns whether it did.
+    pub(super) fn write_stale_index(&self, name: &str) -> Result<bool, Reject> {
+        let _guard = self.publishing.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.db.index_stale(name)? {
+            return Ok(false);
+        }
+        self.write_repository(&self.load_repository(name)?)?;
+        Ok(true)
+    }
+
+    /// Writes every index that is out of date. For start-up: a
+    /// coordinator that stopped between publishing a build and writing
+    /// the index left one behind.
+    pub fn write_stale_indexes(&self) -> Result<(), String> {
+        if self.signing_key.is_none() {
+            return Ok(());
+        }
+        for name in self.db.stale_repositories().map_err(|e| e.to_string())? {
+            self.write_stale_index(&name)
+                .map_err(|Reject(_, message)| format!("the index of {name}: {message}"))?;
+            eprintln!("wrote the index of {name}, which was out of date");
+        }
         Ok(())
     }
 
@@ -273,14 +308,31 @@ impl Coordinator {
     }
 
     /// Publishes the packages a finished job built, from the body of a
-    /// publish call. The reconciler calls this too.
+    /// publish call, and writes the repository's index.
     pub(super) fn publish_build(
         &self,
         admin: &str,
         name: &str,
         body: &Value,
     ) -> Result<Response, Reject> {
-        let key = self.signing_key()?;
+        let response = self.publish_without_index(admin, name, body)?;
+        self.write_stale_index(name)?;
+        Ok(response)
+    }
+
+    /// Publishes the packages a finished job built, and leaves the index
+    /// as it is: clients do not see the build until the index is written
+    /// with [`Coordinator::write_stale_index`]. The reconciler publishes
+    /// every build that finished since its last step this way and then
+    /// writes the index once. Writing it costs as much as the repository
+    /// is large, whatever changed.
+    pub(super) fn publish_without_index(
+        &self,
+        admin: &str,
+        name: &str,
+        body: &Value,
+    ) -> Result<Response, Reject> {
+        self.signing_key()?;
         let repository = self.load_repository(name)?;
         let job_id = int_field(body, "job_id")?;
         let package = str_field(body, "package")?;
@@ -370,11 +422,7 @@ impl Coordinator {
 
         // A rebuild of the same version must carry a higher counter than
         // what is published, so that clients take it as an upgrade.
-        let published = self
-            .db
-            .repository_builds(name)?
-            .into_iter()
-            .find(|b| b.package == package && b.arch == job.arch);
+        let published = self.db.repository_build(name, package, &job.arch)?;
         if let Some(published) = &published {
             let same_build = published.job_id == job_id && published.attempt == job.attempt;
             if published.version == version && published.revision >= revision && !same_build {
@@ -388,14 +436,14 @@ impl Coordinator {
             }
         }
 
-        // Files first, then the database, then the index: a file that
-        // nothing lists yet is harmless, and an index never lists a file
-        // that is not there.
+        // Files first, then the database, and the index after that: a
+        // file that nothing lists yet is harmless, and an index never
+        // lists a file that is not there.
         let root = self.repository_root(name);
         for file in &planned {
             place(&artifact_dir.join(&file.artifact), &root.join(&file.path))?;
         }
-        let replaced = self.db.replace_repository_build(
+        self.db.replace_repository_build(
             name,
             package,
             &job.arch,
@@ -405,13 +453,6 @@ impl Coordinator {
             job.attempt,
             &planned,
         )?;
-        let files = self.db.repository_files(name)?;
-        repo::write_index(&root, &repository, &files, key, seconds_now())?;
-        for path in replaced {
-            if !planned.iter().any(|file| file.path == path) {
-                let _ = fs::remove_file(root.join(path));
-            }
-        }
         eprintln!(
             "admin {admin:?}: {name}: published {package} {version} revision {revision} for {} from job {job_id}",
             job.arch

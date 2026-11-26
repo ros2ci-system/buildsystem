@@ -186,6 +186,7 @@ fn run(args: &[String]) -> Result<(), String> {
         signing_key,
         publishing: std::sync::Mutex::new(()),
         reconciling: std::sync::Mutex::new(()),
+        reconcile_millis: std::sync::atomic::AtomicU64::new(0),
         forges: ci_net::Connector::with_public_roots(None).map_err(|e| e.to_string())?,
         db: db::Db::open(database)?,
         settings: Settings {
@@ -213,6 +214,10 @@ fn run(args: &[String]) -> Result<(), String> {
             path.display()
         );
     }
+
+    // A stop between publishing a build and writing the index left the
+    // index behind what the repository holds.
+    coordinator.write_stale_indexes()?;
 
     // Time spent down must not count against workers that could not
     // reach the coordinator.
@@ -258,7 +263,13 @@ fn run(args: &[String]) -> Result<(), String> {
             let mut last_error = String::new();
             loop {
                 thread::sleep(interval);
-                match coordinator.reconcile() {
+                let started = std::time::Instant::now();
+                let result = coordinator.reconcile();
+                coordinator.reconcile_millis.store(
+                    started.elapsed().as_millis() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                match result {
                     Ok(()) => last_error.clear(),
                     // The same trouble every five seconds is said once.
                     Err(message) if message != last_error => {

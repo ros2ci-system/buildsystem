@@ -61,6 +61,8 @@ pub struct Coordinator {
     pub publishing: std::sync::Mutex<()>,
     /// Held during a step of the reconciler, so that two never overlap.
     pub reconciling: std::sync::Mutex<()>,
+    /// How long the reconciler's last step took, in milliseconds.
+    pub reconcile_millis: std::sync::atomic::AtomicU64,
     /// For asking forges which commit a branch is at.
     pub forges: ci_net::Connector,
 }

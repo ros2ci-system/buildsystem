@@ -1,0 +1,192 @@
+{
+ "rosdistro": "rolling",
+ "rosdistro_repository": "http://127.0.0.1:8446/rosdistro.git",
+ "rosdistro_branch": "main",
+ "rosdistro_files": "http://files.invalid/rosdistro",
+ "poll_seconds": 10,
+ "build_retries": 2,
+ "retry_backoff_seconds": 600,
+ "check": {
+  "pool": "pull-request",
+  "os": "linux",
+  "arch": "amd64",
+  "job": {
+   "image": "registry.invalid/stand-in",
+   "command": [
+    "none"
+   ],
+   "parameters": {},
+   "timeout_seconds": 600
+  }
+ },
+ "archive": {
+  "pool": "release",
+  "os": "linux",
+  "arch": "amd64",
+  "job": {
+   "image": "registry.invalid/stand-in",
+   "command": [
+    "none"
+   ],
+   "parameters": {},
+   "timeout_seconds": 600
+  }
+ },
+ "targets": [
+  {
+   "name": "ubuntu-resolute-amd64",
+   "pool": "release",
+   "os": "linux",
+   "arch": "amd64",
+   "repository": "scale-resolute",
+   "repository_url": "http://repo.invalid/scale-resolute",
+   "platform": {
+    "os": "ubuntu",
+    "version": "resolute"
+   },
+   "tests": false,
+   "names": [
+    "ros-rolling-{name}",
+    "ros-rolling-{name}-dbgsym"
+   ],
+   "job": {
+    "image": "registry.invalid/stand-in",
+    "command": [
+     "none"
+    ],
+    "parameters": {
+     "scale": {
+      "format": "deb",
+      "suffix": "resolute",
+      "prefix": "ros-rolling-"
+     }
+    },
+    "timeout_seconds": 600
+   }
+  },
+  {
+   "name": "ubuntu-resolute-arm64",
+   "pool": "release",
+   "os": "linux",
+   "arch": "arm64",
+   "repository": "scale-resolute",
+   "repository_url": "http://repo.invalid/scale-resolute",
+   "platform": {
+    "os": "ubuntu",
+    "version": "resolute"
+   },
+   "tests": false,
+   "names": [
+    "ros-rolling-{name}",
+    "ros-rolling-{name}-dbgsym"
+   ],
+   "job": {
+    "image": "registry.invalid/stand-in",
+    "command": [
+     "none"
+    ],
+    "parameters": {
+     "scale": {
+      "format": "deb",
+      "suffix": "resolute",
+      "prefix": "ros-rolling-"
+     }
+    },
+    "timeout_seconds": 600
+   }
+  },
+  {
+   "name": "debian-trixie-amd64",
+   "pool": "release",
+   "os": "linux",
+   "arch": "amd64",
+   "repository": "scale-trixie",
+   "repository_url": "http://repo.invalid/scale-trixie",
+   "platform": {
+    "os": "debian",
+    "version": "trixie"
+   },
+   "tests": false,
+   "names": [
+    "ros-rolling-{name}",
+    "ros-rolling-{name}-dbgsym"
+   ],
+   "job": {
+    "image": "registry.invalid/stand-in",
+    "command": [
+     "none"
+    ],
+    "parameters": {
+     "scale": {
+      "format": "deb",
+      "suffix": "trixie",
+      "prefix": "ros-rolling-"
+     }
+    },
+    "timeout_seconds": 600
+   }
+  },
+  {
+   "name": "rhel-10-amd64",
+   "pool": "release",
+   "os": "linux",
+   "arch": "amd64",
+   "repository": "scale-el10",
+   "repository_url": "http://repo.invalid/scale-el10",
+   "platform": {
+    "os": "rhel",
+    "version": "10"
+   },
+   "tests": false,
+   "names": [
+    "ros-rolling-{name}",
+    "ros-rolling-{name}-debuginfo"
+   ],
+   "job": {
+    "image": "registry.invalid/stand-in",
+    "command": [
+     "none"
+    ],
+    "parameters": {
+     "scale": {
+      "format": "rpm",
+      "suffix": ".el10",
+      "prefix": "ros-rolling-"
+     }
+    },
+    "timeout_seconds": 600
+   }
+  },
+  {
+   "name": "rhel-10-arm64",
+   "pool": "release",
+   "os": "linux",
+   "arch": "arm64",
+   "repository": "scale-el10",
+   "repository_url": "http://repo.invalid/scale-el10",
+   "platform": {
+    "os": "rhel",
+    "version": "10"
+   },
+   "tests": false,
+   "names": [
+    "ros-rolling-{name}",
+    "ros-rolling-{name}-debuginfo"
+   ],
+   "job": {
+    "image": "registry.invalid/stand-in",
+    "command": [
+     "none"
+    ],
+    "parameters": {
+     "scale": {
+      "format": "rpm",
+      "suffix": ".el10",
+      "prefix": "ros-rolling-"
+     }
+    },
+    "timeout_seconds": 600
+   }
+  }
+ ]
+}

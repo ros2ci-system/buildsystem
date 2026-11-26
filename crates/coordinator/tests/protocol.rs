@@ -2139,6 +2139,48 @@ fn a_release_is_archived_once_and_read_by_hash() {
     );
 }
 
+#[test]
+fn an_index_left_behind_is_written_at_start() {
+    let key_path = std::env::temp_dir().join(format!("ros2ci-test-key-s-{}", std::process::id()));
+    let key =
+        ci_openpgp::SigningKey::generate("Test <test@example.invalid>", 1_795_000_000).unwrap();
+    fs::write(&key_path, key.to_file_text()).unwrap();
+    let Some(mut c) = Coordinator::start(&["--signing-key", key_path.to_str().unwrap()]) else {
+        return;
+    };
+    let (status, reply) = c.admin(
+        "POST",
+        "/admin/v1/repositories",
+        Some(Value::object([
+            ("name", Value::from("test-apt")),
+            ("format", Value::from("apt")),
+            ("suite", Value::from("resolute")),
+            ("version_suffix", Value::from("resolute")),
+            ("architectures", Value::strings(["amd64"])),
+            ("source_arch", Value::from("amd64")),
+        ])),
+    );
+    assert_eq!(status, 201, "{reply:?}");
+    // A coordinator that stopped after publishing a build and before
+    // writing the index leaves the repository marked, and its index
+    // behind. The top of the index is removed here to see it come back.
+    let top = c.data_dir.join("repos/test-apt/dists/resolute/InRelease");
+    assert!(top.exists());
+    c.stop();
+    fs::remove_file(&top).unwrap();
+    let config = ci_postgres::Config::parse(&c.database_url).unwrap();
+    let mut database = ci_postgres::Connection::connect(&config).unwrap();
+    database
+        .batch("UPDATE repositories SET index_stale = true")
+        .unwrap();
+    drop(database);
+    c.restart();
+    assert!(top.exists(), "the index was not written at start");
+    let (_, status) = c.admin("GET", "/admin/v1/repositories/test-apt", None);
+    assert_eq!(str_of(&status, "name"), "test-apt");
+    let _ = fs::remove_file(&key_path);
+}
+
 /// Answers the first request of a git fetch: the list of refs, with one
 /// branch at the commit given.
 fn serve_git_refs(commit: &'static str) -> String {
@@ -2177,11 +2219,14 @@ fn the_reconciler_takes_a_release_in_and_builds_it_in_order() {
     let key =
         ci_openpgp::SigningKey::generate("Test <test@example.invalid>", 1_795_000_000).unwrap();
     fs::write(&key_path, key.to_file_text()).unwrap();
+    let repo_url = format!("http://127.0.0.1:{}", free_port());
     let Some(c) = Coordinator::start(&[
         "--signing-key",
         key_path.to_str().unwrap(),
         "--reconcile-interval-seconds",
         "1",
+        "--repo-listen",
+        repo_url.strip_prefix("http://").unwrap(),
     ]) else {
         return;
     };
@@ -2314,6 +2359,7 @@ fn the_reconciler_takes_a_release_in_and_builds_it_in_order() {
         ],
     );
 
+    let parameters_low_revision = std::cell::Cell::new(0);
     // A build job: the package it is for, its revision, and a package
     // that it "builds".
     let build = |expected: &str, outcome: &str| {
@@ -2325,6 +2371,25 @@ fn the_reconciler_takes_a_release_in_and_builds_it_in_order() {
             str_of(input, "url"),
             format!("archive:{}", hex_encode(&sha256(tarball)))
         );
+        if expected == "high" {
+            // By the time this build was queued, the index a client
+            // reads listed the build of "low" that it is to use.
+            let (_, index) = c.call(
+                &repo_url,
+                "GET",
+                "/test-apt/dists/resolute/main/binary-amd64/Packages",
+                None,
+                None,
+            );
+            let low = parameters_low_revision.get();
+            assert!(
+                String::from_utf8_lossy(&index)
+                    .contains(&format!("Version: 1.0.0-{low}resolute\n")),
+                "the index does not list revision {low} of low"
+            );
+        } else {
+            parameters_low_revision.set(revision);
+        }
         let metadata = format!(
             r#"{{"version": 1, "format": "deb", "packages": [{{"file": "packages/p.deb", "kind": "binary",
                 "fields": [["Package", "ros-rolling-{expected}"], ["Version", "1.0.0-{revision}resolute"],
