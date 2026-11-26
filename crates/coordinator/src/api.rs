@@ -26,6 +26,7 @@ use ci_protocol::{
 
 use crate::db::{self, Artifact, Db, Requeue, Worker};
 
+mod archive;
 mod repositories;
 
 /// Largest JSON request body accepted. A Report carries a chunk of log,
@@ -181,6 +182,14 @@ impl Coordinator {
                     .parse()
                     .map_err(|_| reject(404, "no such attempt"))?;
                 self.download_stored_file(&worker, job_id, attempt, name)
+            }
+            ("GET", ["worker", "v1", "jobs", job_id, "attempts", attempt, "archive", sha256]) => {
+                let worker = self.authenticate(request)?;
+                let job_id: i64 = job_id.parse().map_err(|_| reject(404, "no such job"))?;
+                let attempt: i64 = attempt
+                    .parse()
+                    .map_err(|_| reject(404, "no such attempt"))?;
+                self.download_archived(&worker, job_id, attempt, sha256)
             }
             _ => Err(reject(404, "not found")),
         }
@@ -603,6 +612,8 @@ impl Coordinator {
             ("GET", ["admin", "v1", "jobs", id, "artifacts", rest @ ..]) if !rest.is_empty() => {
                 self.job_artifact(job(id)?, &rest.join("/"))
             }
+            ("POST", ["admin", "v1", "archive"]) => self.archive_release(&admin, request),
+            ("GET", ["admin", "v1", "archive", rosdistro]) => self.archived_releases(rosdistro),
             ("POST", ["admin", "v1", "repositories"]) => self.create_repository(&admin, request),
             ("GET", ["admin", "v1", "repositories", name]) => self.repository_status(name),
             ("POST", ["admin", "v1", "repositories", name, "revisions"]) => {
@@ -813,6 +824,14 @@ impl Coordinator {
                 return Err(Reject(
                     400,
                     format!("job description: there is no stored file named {name:?}"),
+                ));
+            }
+        }
+        for hash in parsed.archived_sources() {
+            if !self.is_archived(hash)? {
+                return Err(Reject(
+                    400,
+                    format!("job description: the source archive holds no tarball {hash}"),
                 ));
             }
         }

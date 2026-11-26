@@ -33,7 +33,8 @@ use ci_json::Value;
 
 use ci_net::{Connector, Url};
 use ci_protocol::{
-    stored_file_path, BuildDefinition, Image, JobDescription, JobKind, Outcome, Source,
+    archived_source_path, stored_file_path, BuildDefinition, Image, JobDescription, JobKind,
+    Outcome, Source,
 };
 
 /// The exit code a job uses to say "this failed for a reason outside the
@@ -721,7 +722,7 @@ fn build_upload_archive(job: &JobDescription, downloads: &Path, path: &Path) -> 
     for input in &job.inputs {
         let source = match &input.source {
             Source::LocalFile(source) => source.clone(),
-            Source::Url(_) | Source::Stored(_) => downloads.join(&input.name),
+            Source::Url(_) | Source::Stored(_) | Source::Archive(_) => downloads.join(&input.name),
         };
         let mut file = File::open(&source)
             .map_err(|e| format!("input {}: {}: {e}", input.name, source.display()))?;
@@ -790,6 +791,21 @@ fn fetch(
                 format!("stored file {name}"),
             )
         }
+        Source::Archive(hash) => {
+            let access = fetcher.stored.as_ref().ok_or(
+                "the source archive can only be read by a job that came from a coordinator",
+            )?;
+            (
+                fetcher.connector,
+                access.coordinator.with_target(&archived_source_path(
+                    access.job_id,
+                    access.attempt,
+                    hash,
+                )),
+                Some(format!("Bearer {}", access.token)),
+                format!("archived source {hash}"),
+            )
+        }
     };
     let host = url.host_header();
     let mut request = ci_http::Request::new("GET", &url.target, &host);
@@ -821,6 +837,16 @@ fn fetch(
         }
     }
     file.flush().map_err(|e| format!("saving {what}: {e}"))?;
+    drop(file);
+    // An archived tarball is named by its hash, so what arrived can be
+    // checked against its name.
+    if let Source::Archive(expected) = source {
+        let actual = hash_file(path).map_err(|e| format!("checking {what}: {e}"))?;
+        if &actual != expected {
+            let _ = fs::remove_file(path);
+            return Err(format!("{what}: what arrived has the SHA-256 {actual}"));
+        }
+    }
     Ok(false)
 }
 

@@ -226,6 +226,34 @@ ci-admin publish --repository rolling-resolute --job 7 --package ament_package \
 - **Nothing is compressed.** There is no compressor in this code. apt
   and dnf both read the plain index files.
 
+### Releases and the source archive
+
+A release enters the system through two jobs, which `ci-admin release` runs
+for a rosdistro commit: a release check, which builds nothing, and one
+source archive job for each release the archive does not hold yet.
+
+```
+ci-admin release --rosdistro-url https://raw.githubusercontent.com/example/rosdistro \
+    --commit 5a071f7f --check-job release-check.json --archive-job source-archive.json
+ci-admin archived
+```
+
+- **The archive.** The coordinator keeps each release's tarball under
+  `archive` in its data directory, named by its SHA-256, with a record of
+  the repository, tag, commit and packages. An entry is never replaced.
+- **Reading it.** A job names a tarball as the input `archive:<sha256>`.
+  The worker downloads it from the coordinator and checks the hash. A job
+  that names a tarball the archive does not hold is refused when it is
+  submitted.
+- **Moved tags.** The check looks at the tag of every archived release
+  again. A tag that names another commit than the archived one, or is
+  gone, is reported, and builds go on reading the archive.
+- **Where the logic is.** The check and the archive job are scripts in the
+  configuration, and their job descriptions are the two files the command
+  is given. The command adds their parameters and tells the coordinator
+  to take each tarball in; the coordinator checks the job's own record
+  against the release the command names.
+
 ## Testing
 
 The tests are defined by `ci/Dockerfile.test` and run the same way anywhere

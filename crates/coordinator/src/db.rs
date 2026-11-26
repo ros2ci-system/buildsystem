@@ -130,6 +130,21 @@ const MIGRATIONS: &[&str] = &[
         metadata text NOT NULL,
         PRIMARY KEY (repository, path)
     );",
+    // 6: the source archive. One entry per version of a repository in a
+    // ROS distribution, never replaced.
+    "CREATE TABLE source_archive (
+        rosdistro text NOT NULL,
+        repository text NOT NULL,
+        version text NOT NULL,
+        commit_id text NOT NULL,
+        sha256 text NOT NULL,
+        record text NOT NULL,
+        job_id bigint NOT NULL REFERENCES jobs (id),
+        attempt bigint NOT NULL,
+        archived_at timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (rosdistro, repository, version)
+    );
+    CREATE INDEX source_archive_sha256 ON source_archive (sha256);",
 ];
 
 const TIMESTAMP: &str = "'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'";
@@ -228,6 +243,19 @@ pub struct PublishedBuild {
     pub job_id: i64,
     pub attempt: i64,
     pub published_at: String,
+}
+
+/// A release in the source archive.
+#[derive(Debug, Clone)]
+pub struct ArchivedRelease {
+    pub rosdistro: String,
+    pub repository: String,
+    pub version: String,
+    pub commit: String,
+    /// The tarball's hash, which is also its name in the archive.
+    pub sha256: String,
+    /// Everything recorded about the release, as JSON.
+    pub record: String,
 }
 
 /// What happened to a job that failed for an infrastructure reason.
@@ -502,6 +530,78 @@ impl Db {
                 )?;
                 Ok(replaced)
             })
+        })
+    }
+
+    pub fn archive_release(
+        &self,
+        release: &ArchivedRelease,
+        job_id: i64,
+        attempt: i64,
+    ) -> Result<(), Error> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO source_archive
+                     (rosdistro, repository, version, commit_id, sha256, record, job_id, attempt)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                &[
+                    (&release.rosdistro).into(),
+                    (&release.repository).into(),
+                    (&release.version).into(),
+                    (&release.commit).into(),
+                    (&release.sha256).into(),
+                    (&release.record).into(),
+                    job_id.into(),
+                    attempt.into(),
+                ],
+            )
+            .map(|_| ())
+        })
+    }
+
+    pub fn archived_release(
+        &self,
+        rosdistro: &str,
+        repository: &str,
+        version: &str,
+    ) -> Result<Option<ArchivedRelease>, Error> {
+        self.with(|c| {
+            c.query(
+                "SELECT rosdistro, repository, version, commit_id, sha256, record
+                 FROM source_archive
+                 WHERE rosdistro = $1 AND repository = $2 AND version = $3",
+                &[rosdistro.into(), repository.into(), version.into()],
+            )?
+            .first()
+            .map(archived_release_from_row)
+            .transpose()
+        })
+    }
+
+    /// Every archived release of a ROS distribution, oldest first.
+    pub fn archived_releases(&self, rosdistro: &str) -> Result<Vec<ArchivedRelease>, Error> {
+        self.with(|c| {
+            c.query(
+                "SELECT rosdistro, repository, version, commit_id, sha256, record
+                 FROM source_archive WHERE rosdistro = $1
+                 ORDER BY archived_at, repository, version",
+                &[rosdistro.into()],
+            )?
+            .iter()
+            .map(archived_release_from_row)
+            .collect()
+        })
+    }
+
+    /// Whether any release was archived as a tarball of this hash.
+    pub fn archived_tarball(&self, sha256: &str) -> Result<bool, Error> {
+        self.with(|c| {
+            Ok(!c
+                .query(
+                    "SELECT 1 FROM source_archive WHERE sha256 = $1 LIMIT 1",
+                    &[sha256.into()],
+                )?
+                .is_empty())
         })
     }
 
@@ -1038,6 +1138,17 @@ fn artifact_from_row(row: &Row) -> Result<Artifact, Error> {
         path: row.text(0)?.to_string(),
         size: row.int(1)?,
         sha256: row.text(2)?.to_string(),
+    })
+}
+
+fn archived_release_from_row(row: &Row) -> Result<ArchivedRelease, Error> {
+    Ok(ArchivedRelease {
+        rosdistro: row.text(0)?.to_string(),
+        repository: row.text(1)?.to_string(),
+        version: row.text(2)?.to_string(),
+        commit: row.text(3)?.to_string(),
+        sha256: row.text(4)?.to_string(),
+        record: row.text(5)?.to_string(),
     })
 }
 

@@ -62,7 +62,7 @@ fn seconds_now() -> u64 {
 
 /// Puts a job's artifact at a path in a repository. A hard link where
 /// the two are on one filesystem, which costs no space; a copy otherwise.
-fn place(source: &Path, target: &Path) -> io::Result<()> {
+pub(super) fn place(source: &Path, target: &Path) -> io::Result<()> {
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }

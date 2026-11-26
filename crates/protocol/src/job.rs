@@ -22,6 +22,9 @@ use ci_json::Value;
 /// The prefix of a URL that names a file stored on the coordinator.
 pub const STORED_PREFIX: &str = "stored:";
 
+/// What begins the URL of a tarball in the coordinator's source archive.
+pub const ARCHIVE_PREFIX: &str = "archive:";
+
 /// How long an image build may take when the job does not say.
 const DEFAULT_BUILD_TIMEOUT: Duration = Duration::from_secs(2 * 3600);
 
@@ -115,6 +118,10 @@ pub enum Source {
     /// A file stored on the coordinator under this name, from a
     /// `stored:` URL. The worker running the job may download it.
     Stored(String),
+    /// A tarball in the coordinator's source archive, from an
+    /// `archive:` URL, named by its SHA-256 in lower-case hex. The
+    /// worker running the job may download it, and checks the hash.
+    Archive(String),
 }
 
 impl Source {
@@ -131,11 +138,19 @@ impl Source {
                 ));
             }
             Ok(Source::Stored(name.to_string()))
+        } else if let Some(hash) = url.strip_prefix(ARCHIVE_PREFIX) {
+            let hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+            if hash.len() != 64 || !hash.bytes().all(hex) {
+                return Err(format!(
+                    "{url:?} must name a tarball by 64 lower-case hex digits"
+                ));
+            }
+            Ok(Source::Archive(hash.to_string()))
         } else if url.starts_with("http://") || url.starts_with("https://") {
             Ok(Source::Url(url.to_string()))
         } else {
             Err(format!(
-                "URL {url:?} must start with http://, https://, stored: or file://"
+                "URL {url:?} must start with http://, https://, stored:, archive: or file://"
             ))
         }
     }
@@ -162,6 +177,16 @@ impl JobDescription {
         self.sources()
             .filter_map(|source| match source {
                 Source::Stored(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The hashes of the archived tarballs the job reads.
+    pub fn archived_sources(&self) -> Vec<&str> {
+        self.sources()
+            .filter_map(|source| match source {
+                Source::Archive(hash) => Some(hash.as_str()),
                 _ => None,
             })
             .collect()
@@ -345,6 +370,9 @@ fn parse_image(value: &Value) -> Result<Image, String> {
             Some(hash.to_ascii_lowercase())
         }
     };
+    if matches!(context, Source::Archive(_)) {
+        return Err("a build context cannot come from the source archive".to_string());
+    }
     // A context fetched from elsewhere could change under the same URL.
     // Its hash pins what is built, and names the result.
     if matches!(context, Source::Url(_) | Source::LocalFile(_)) && context_sha256.is_none() {
@@ -527,6 +555,21 @@ mod tests {
         );
         assert_eq!(job.inputs[1].source, Source::Url("http://h/b".into()));
         assert_eq!(job.inputs[2].source, Source::Stored("license.dat".into()));
+        let hash = "0123456789abcdef".repeat(4);
+        let archived = JobDescription::parse(&with(&format!(
+            r#""inputs": [{{"name": "source.tar.gz", "url": "archive:{hash}"}}]"#
+        )))
+        .unwrap();
+        assert_eq!(archived.inputs[0].source, Source::Archive(hash.clone()));
+        assert_eq!(archived.archived_sources(), [hash.as_str()]);
+        for bad in [
+            "archive:",
+            "archive:abc",
+            &format!("archive:{}", hash.to_uppercase()),
+        ] {
+            let text = with(&format!(r#""inputs": [{{"name": "a", "url": "{bad}"}}]"#));
+            assert!(JobDescription::parse(&text).is_err(), "{bad}");
+        }
         assert!(!job.has_local_inputs());
         assert_eq!(job.stored_files(), ["license.dat"]);
 

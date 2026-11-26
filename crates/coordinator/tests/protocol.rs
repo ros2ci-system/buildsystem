@@ -1995,3 +1995,146 @@ fn nothing_is_published_without_a_signing_key() {
     );
     assert_eq!(status, 409, "{reply:?}");
 }
+
+#[test]
+fn a_release_is_archived_once_and_read_by_hash() {
+    let Some(c) = Coordinator::start(&[]) else {
+        return;
+    };
+    let session = c.register("release", "linux", "amd64");
+    let commit = "a".repeat(40);
+
+    // A job that leaves a tarball and says what it is.
+    let run_archive_job = |tarball: &[u8], commit: &str| {
+        let job_id = c.submit("release", "linux", "amd64");
+        let job = c.claim(&session).unwrap();
+        let record = Value::object([
+            ("repository", Value::from("my_repo")),
+            ("version", Value::from("1.2.3")),
+            ("url", Value::from("https://example.invalid/my_repo.git")),
+            ("tag", Value::from("1.2.3")),
+            ("commit", Value::from(commit)),
+            ("sha256", Value::from(hex_encode(&sha256(tarball)))),
+            (
+                "packages",
+                Value::Array(vec![Value::object([
+                    ("name", Value::from("my_tool")),
+                    ("path", Value::from("my_tool")),
+                    ("version", Value::from("1.2.3")),
+                    ("build_type", Value::from("ament_cmake")),
+                ])]),
+            ),
+        ])
+        .to_json();
+        let mut listed = Vec::new();
+        for (path, data) in [
+            ("source.tar.gz", tarball),
+            ("record.json", record.as_bytes()),
+        ] {
+            let target = format!("/worker/v1/jobs/{job_id}/attempts/1/artifacts/{path}");
+            assert_eq!(
+                c.call(&c.worker_url, "PUT", &target, Some(&session), Some(data))
+                    .0,
+                200
+            );
+            listed.push(Value::object([
+                ("path", Value::from(path)),
+                ("size", Value::Int(data.len() as i64)),
+                ("sha256", Value::from(hex_encode(&sha256(data)))),
+            ]));
+        }
+        assert_eq!(c.finish(&session, job, "success", listed).0, 200);
+        job_id
+    };
+    let archive = |job_id: i64, commit: &str| {
+        c.admin(
+            "POST",
+            "/admin/v1/archive",
+            Some(Value::object([
+                ("job_id", Value::Int(job_id)),
+                ("rosdistro", Value::from("rolling")),
+                ("repository", Value::from("my_repo")),
+                ("version", Value::from("1.2.3")),
+                ("url", Value::from("https://example.invalid/my_repo.git")),
+                ("tag", Value::from("1.2.3")),
+                ("commit", Value::from(commit)),
+            ])),
+        )
+    };
+
+    let tarball = b"the bytes of a source tarball";
+    let hash = hex_encode(&sha256(tarball));
+    let first = run_archive_job(tarball, &commit);
+    // The caller says which commit the release is. A job that archived
+    // another one is refused.
+    let (status, reply) = archive(first, &"b".repeat(40));
+    assert_eq!(status, 400, "{reply:?}");
+    let (status, reply) = archive(first, &commit);
+    assert_eq!(status, 201, "{reply:?}");
+    assert_eq!(str_of(&reply, "sha256"), hash);
+    assert_eq!(
+        archive(first, &commit).0,
+        200,
+        "the same again changes nothing"
+    );
+
+    // A release is never replaced, whatever upstream's tag says later.
+    let second = run_archive_job(b"other bytes", &"b".repeat(40));
+    let (status, reply) = archive(second, &"b".repeat(40));
+    assert_eq!(status, 409, "{reply:?}");
+    let (_, listed) = c.admin("GET", "/admin/v1/archive/rolling", None);
+    let releases = listed.get("releases").unwrap().as_array().unwrap();
+    assert_eq!(releases.len(), 1);
+    assert_eq!(str_of(&releases[0], "commit"), commit);
+    let packages = releases[0].get("packages").unwrap().as_array().unwrap();
+    assert_eq!(str_of(&packages[0], "name"), "my_tool");
+
+    // A job reads the tarball by its hash, and only a job that names it.
+    let with_input = |hash: &str| {
+        let Value::Object(mut members) = description() else {
+            unreachable!()
+        };
+        members.push((
+            "inputs".to_string(),
+            Value::Array(vec![Value::object([
+                ("name", Value::from("source.tar.gz")),
+                ("url", Value::from(format!("archive:{hash}"))),
+            ])]),
+        ));
+        c.admin(
+            "POST",
+            "/admin/v1/jobs",
+            Some(Value::object([
+                ("pool", Value::from("release")),
+                ("os", Value::from("linux")),
+                ("arch", Value::from("amd64")),
+                ("description", Value::Object(members)),
+            ])),
+        )
+    };
+    assert_eq!(
+        with_input(&"0".repeat(64)).0,
+        400,
+        "the archive holds no such tarball"
+    );
+    let (status, reply) = with_input(&hash);
+    assert_eq!(status, 201, "{reply:?}");
+    let reader = reply.get("job_id").unwrap().as_i64().unwrap();
+    assert_eq!(c.claim(&session).unwrap().0, reader);
+    let download = |job_id: i64| {
+        c.call(
+            &c.worker_url,
+            "GET",
+            &format!("/worker/v1/jobs/{job_id}/attempts/1/archive/{hash}"),
+            Some(&session),
+            None,
+        )
+    };
+    let (status, bytes) = download(reader);
+    assert_eq!((status, bytes.as_slice()), (200, &tarball[..]));
+    assert_ne!(
+        download(first).0,
+        200,
+        "that job is finished and never named it"
+    );
+}

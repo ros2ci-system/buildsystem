@@ -15,6 +15,8 @@ use ci_json::Value;
 use ci_net::{Connector, Url};
 use ci_openpgp::SigningKey;
 
+mod release;
+
 const USAGE: &str = "\
 Usage: ci-admin [--admin-url <url>] [--token-file <file>] <command>
 
@@ -62,6 +64,20 @@ Commands:
       Downloads one artifact of a job.
   cancel <job-id>
       Cancels a job.
+  release --rosdistro-url <url> --commit <commit> --check-job <file>
+          --archive-job <file> [--rosdistro <name>] [--check-pool <pool>]
+          [--archive-pool <pool>] [--os <os>] [--arch <arch>]
+      Takes the releases of a rosdistro commit into the system. The URL is
+      where the rosdistro's files are, without the commit. It runs the
+      release check, which looks at every release and builds nothing, and
+      then archives the source of each release the archive does not hold.
+      A tag that no longer names the commit that was archived is reported.
+      The two files describe the jobs; this command adds their parameters.
+      Defaults: rosdistro rolling, pools pull-request and release,
+      linux/amd64. Exit status 1 when the check found a problem or a
+      release could not be archived; nothing is archived after a problem.
+  archived [--rosdistro <name>]
+      Lists the releases in the source archive, as JSON.
   generate-signing-key --user-id <text> --output <file>
       Makes the key that signs repository indexes and writes it to a new
       file that only you can read. It talks to no coordinator and needs
@@ -570,6 +586,60 @@ fn run(admin: &Admin, command: &str, args: &[String]) -> Result<ExitCode, String
                 fs::File::create(output).map_err(|e| format!("cannot create {output}: {e}"))?;
             io::copy(&mut response, &mut file)
                 .map_err(|e| format!("downloading to {output}: {e}"))?;
+            Ok(ExitCode::SUCCESS)
+        }
+        "release" => {
+            let (options, positional) = parse_args(args, &[])?;
+            only_options(
+                &options,
+                &[
+                    "rosdistro-url",
+                    "commit",
+                    "check-job",
+                    "archive-job",
+                    "rosdistro",
+                    "check-pool",
+                    "archive-pool",
+                    "os",
+                    "arch",
+                ],
+            )?;
+            if !positional.is_empty() {
+                return Err(format!("unexpected argument {:?}", positional[0]));
+            }
+            let or = |name: &str, default: &'static str| option(&options, name).unwrap_or(default);
+            let commit = option(&options, "commit")?;
+            if commit.is_empty() || !commit.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                return Err("--commit must be a commit id".to_string());
+            }
+            release::release(
+                admin,
+                &release::Options {
+                    rosdistro_url: option(&options, "rosdistro-url")?,
+                    commit,
+                    rosdistro: or("rosdistro", "rolling"),
+                    check_job: option(&options, "check-job")?,
+                    archive_job: option(&options, "archive-job")?,
+                    check_pool: or("check-pool", "pull-request"),
+                    archive_pool: or("archive-pool", "release"),
+                    os: or("os", "linux"),
+                    arch: or("arch", "amd64"),
+                },
+            )
+        }
+        "archived" => {
+            let (options, positional) = parse_args(args, &[])?;
+            only_options(&options, &["rosdistro"])?;
+            if !positional.is_empty() {
+                return Err(format!("unexpected argument {:?}", positional[0]));
+            }
+            let rosdistro = option(&options, "rosdistro").unwrap_or("rolling");
+            let archived = admin.json(
+                "GET",
+                &format!("/admin/v1/archive/{}", ci_http::percent_encode(rosdistro)),
+                None,
+            )?;
+            print!("{}", archived.to_json_pretty());
             Ok(ExitCode::SUCCESS)
         }
         "create-repository" => {

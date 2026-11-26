@@ -45,6 +45,12 @@ pub fn stored_file_path(job_id: i64, attempt: i64, name: &str) -> String {
     format!("/worker/v1/jobs/{job_id}/attempts/{attempt}/files/{name}")
 }
 
+/// Where a worker downloads an archived source tarball that its job
+/// reads.
+pub fn archived_source_path(job_id: i64, attempt: i64, sha256: &str) -> String {
+    format!("/worker/v1/jobs/{job_id}/attempts/{attempt}/archive/{sha256}")
+}
+
 /// How a job ended, as the worker reports it in Finish.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
